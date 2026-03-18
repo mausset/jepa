@@ -1,0 +1,10 @@
+
+data:
+  data_root: data/walking_tours/240p_hevc
+  sequence_length: 32
+  stride: 1
+  step: -1
+  photometric: false
+  resolution: 224
+  num_threads: 4
+  batch_size: 1

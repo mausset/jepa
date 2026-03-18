@@ -1,0 +1,47 @@
+
+encoder:
+  dim: 384
+  depth: 12
+  heads: 6
+  patch_size: 14
+  resolution: 224
+  n_registers: 1
+
+predictor:
+  dim: 384
+  depth: 12
+  heads: 6
+  context: 8
+  noise_dim: 32
+  k: 24
+
+data:
+  data_root: data/walking_tours/240p_hevc_ext/
+  val_root: data/walking_tours/240p_hevc_ext_val/
+  sequence_length: 8
+  photometric: false
+  crop_aspect: True
+  stride: 1
+  step: 1
+  resolution: 224
+  num_threads: 8
+  batch_size: 44
+
+training:
+  project: jepa
+  seed: 42
+  loss: mse
+  distributed: true
+  warmup_steps: 2000
+  total_steps: 100000
+  lambda: 0.01
+  optimizer: muon
+  lr_start: 1e-4
+  lr: 4e-4
+  cooldown_frac: 0.2
+  final_lr_frac: 0.1
+  wd: 4e-2
+  clip_grad: 10.0
+  val_fraction: 0.025
+  ckpt_fraction: 0.5
+  # wandb: disabled

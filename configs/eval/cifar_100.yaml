@@ -1,0 +1,15 @@
+data:
+  resolution: 224
+  batch_size: 256
+  num_threads: 12
+
+heads: 12
+features: "feature_map"
+project: "factored-ssl"
+accumulation_steps: 1
+lr: 1e-3
+wd: 0.01
+epochs: 100
+num_classes: 100
+
+

@@ -1,0 +1,10 @@
+
+data:
+  data_root: data/walking_tours/480p_hevc_ext
+  sequence_length: 12
+  stride: 1
+  step: -1
+  photometric: true
+  resolution: 448
+  num_threads: 4
+  batch_size: 1
