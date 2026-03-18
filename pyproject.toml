@@ -12,5 +12,5 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["kernel_jepa*"]
-
+include = ["jepa*"]
+namespaces = true
