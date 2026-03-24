@@ -1,7 +1,10 @@
 from einops import rearrange, repeat
 from torch import nn
 
-from jepa.models.encoder import ViT
+from jepa.models.action_decoder import TransformerActionDecoder
+from jepa.models.encoder import build_encoder
+from jepa.models.encoder import build_encoder_config
+from jepa.models.predictor import build_predictor_config
 from jepa.models.predictor import Predictor
 
 
@@ -10,13 +13,26 @@ class JEPA(nn.Module):
         self,
         encoder_args,
         predictor_args,
+        action_decoder_args=None,
     ):
         super().__init__()
+        predictor_args = build_predictor_config(predictor_args)
+        encoder_args = dict(encoder_args)
+        if encoder_args.get("arch", "vit-s").startswith("convnext"):
+            encoder_args.setdefault("dim", predictor_args["dim"])
+        encoder_args = build_encoder_config(encoder_args)
+
         self.dim = encoder_args["dim"]
         self.k = predictor_args["k"]
 
-        self.encoder = ViT(encoder_args)
+        self.encoder = build_encoder(encoder_args)
         self.predictor = Predictor(predictor_args)
+
+        self.action_decoder = None
+        if action_decoder_args and action_decoder_args.get("enabled", False):
+            decoder_args = dict(action_decoder_args)
+            decoder_args.setdefault("in_dim", self.dim)
+            self.action_decoder = TransformerActionDecoder(decoder_args)
 
     @property
     def device(self):
@@ -36,7 +52,13 @@ class JEPA(nn.Module):
         pred = self.predictor(s)
         pred = rearrange(pred, "(k b) ... -> k b ...", k=self.k)
 
+        action_pred = None
+        if self.action_decoder is not None:
+            pooled_state = state.mean(dim=2).detach()
+            action_pred = self.action_decoder(pooled_state)[:, 1:]
+
         return {
             "pred": pred,
             "state": state,
+            "action_pred": action_pred,
         }

@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 
-from jepa.models.model import JEPA
+from jepa.models.jepa import JEPA
 
 
 class BasePlanner(ABC):

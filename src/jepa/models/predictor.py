@@ -1,11 +1,52 @@
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from rotary_embedding_torch import RotaryEmbedding
+from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from torch import nn
 
 from jepa.models.modules import SwiGLUFFN
 from jepa.utils.helpers import block_attention_mask
+
+
+VIT_VARIANTS = {
+    "vit-s": {
+        "dim": 384,
+        "depth": 12,
+        "heads": 6,
+    },
+    "vit-b": {
+        "dim": 768,
+        "depth": 12,
+        "heads": 12,
+    },
+    "vit-l": {
+        "dim": 1024,
+        "depth": 24,
+        "heads": 16,
+    },
+}
+
+MLP_VARIANTS = {
+    "mlp": {
+        "dim": 384,
+        "hidden_dim": 384,
+        "num_layers": 4,
+    },
+}
+
+
+def build_predictor_config(config: dict) -> dict:
+    arch = config.get("arch", "vit-s")
+    if arch in VIT_VARIANTS:
+        resolved = dict(VIT_VARIANTS[arch])
+    elif arch in MLP_VARIANTS:
+        resolved = dict(MLP_VARIANTS[arch])
+    else:
+        raise ValueError(f"Unknown predictor arch: {arch}")
+
+    resolved.update(config)
+    resolved["arch"] = arch
+    return resolved
 
 
 def modulate(x, scale, shift):
@@ -60,24 +101,26 @@ class PredictorBlock(nn.Module):
         nn.init.zeros_(self.ada_ln[-1].bias)  # type: ignore
 
     def forward(self, x, latent, attn_mask=None):
-        B, N, D = x.shape
+        B, T, N, D = x.shape
 
         attn_scale, attn_shift, attn_gate, ffn_scale, ffn_shift, ffn_gate = self.ada_ln(
             latent
         ).chunk(6, dim=-1)
 
         x_pre_attn = x
-        x = modulate(self.norm_attn(x), attn_scale, attn_shift)
+        x = rearrange(modulate(self.norm_attn(x), attn_scale, attn_shift), "b t n d -> b (t n) d")
 
-        q = rearrange(self.to_q(x), "b n (h d) -> b h n d", h=self.heads)
-        k = rearrange(self.to_k(x), "b n (h d) -> b h n d", h=self.heads)
-        v = rearrange(self.to_v(x), "b n (h d) -> b h n d", h=self.heads)
+        q = rearrange(self.to_q(x), "b s (h d) -> b h s d", h=self.heads)
+        k = rearrange(self.to_k(x), "b s (h d) -> b h s d", h=self.heads)
+        v = rearrange(self.to_v(x), "b s (h d) -> b h s d", h=self.heads)
 
         q = self.norm_q(q)
         k = self.norm_k(k)
 
-        q = self.rope.rotate_queries_or_keys(q)
-        k = self.rope.rotate_queries_or_keys(k)
+        positions = repeat(torch.arange(T, device=x.device), "t -> (t n)", n=N).float()
+        freqs = self.rope.forward(positions)
+        q = apply_rotary_emb(freqs, q)
+        k = apply_rotary_emb(freqs, k)
 
         if attn_mask is not None:
             attn_mask = repeat(attn_mask, "b ... -> b 1 ...")
@@ -85,7 +128,7 @@ class PredictorBlock(nn.Module):
         with nn.attention.sdpa_kernel(self.sdpa_list):
             attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
-        attn_output = rearrange(attn_output, "b h n d -> b n (h d)")
+        attn_output = rearrange(attn_output, "b h (t n) d -> b t n (h d)", t=T, n=N)
         attn_output = self.attn_out(attn_output)
 
         x = x_pre_attn + attn_gate * attn_output
@@ -94,7 +137,7 @@ class PredictorBlock(nn.Module):
         return x
 
 
-class Predictor(nn.Module):
+class TransformerPredictor(nn.Module):
     def __init__(self, predictor_args) -> None:
         super().__init__()
 
@@ -129,13 +172,54 @@ class Predictor(nn.Module):
         attn_mask = block_attention_mask(x)
         attn_mask = repeat(attn_mask, "m n -> b m n", b=B)
 
-        x = rearrange(x, "b t n d ->  b (t n) d")
-
-        latent = torch.randn(B, T * N, self.noise_dim, device=x.device)
+        latent = torch.randn(B, T, N, self.noise_dim, device=x.device)
         latent = self.noise_embed(latent)
 
         for block in self.blocks:
             x = block(x, latent, attn_mask=attn_mask)
-        x = rearrange(x, "b (t n) d -> b t n d", n=N)
 
         return x
+
+
+class MLPPredictor(nn.Module):
+    def __init__(self, predictor_args) -> None:
+        super().__init__()
+
+        self.dim = predictor_args["dim"]
+        self.noise_dim = predictor_args["noise_dim"]
+        hidden_dim = predictor_args["hidden_dim"]
+        num_layers = predictor_args["num_layers"]
+
+        if num_layers != 4:
+            raise ValueError("MLP predictor currently expects num_layers == 4.")
+
+        self.net = nn.Sequential(
+            nn.Linear(self.dim + self.noise_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.dim),
+        )
+
+    def forward(self, x):
+        latent = torch.randn(*x.shape[:-1], self.noise_dim, device=x.device)
+        x = torch.cat((x, latent), dim=-1)
+        return self.net(x)
+
+
+class Predictor(nn.Module):
+    def __init__(self, predictor_args) -> None:
+        super().__init__()
+
+        predictor_args = build_predictor_config(predictor_args)
+        self.arch = predictor_args["arch"]
+
+        if self.arch == "mlp":
+            self.model = MLPPredictor(predictor_args)
+        else:
+            self.model = TransformerPredictor(predictor_args)
+
+    def forward(self, x):
+        return self.model(x)

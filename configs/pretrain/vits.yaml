@@ -1,16 +1,12 @@
 
 encoder:
-  dim: 384
-  depth: 12
-  heads: 6
+  arch: vit-s
   patch_size: 14
   resolution: 224
   n_registers: 1
 
 predictor:
-  dim: 384
-  depth: 12
-  heads: 6
+  arch: vit-s
   context: 8
   noise_dim: 32
   k: 24
@@ -35,6 +31,8 @@ training:
   warmup_steps: 2000
   total_steps: 100000
   lambda: 0.01
+  temp_mode: fixed
+  temp: 0.01
   optimizer: muon
   lr_start: 1e-4
   lr: 4e-4

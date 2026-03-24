@@ -3,8 +3,51 @@ import torch.nn.functional as F
 from einops import pack, rearrange, repeat, unpack
 from einops.layers.torch import Rearrange
 from torch import nn
+from torchvision.models import convnext_base, convnext_large, convnext_small, convnext_tiny
 
 from jepa.models.modules import SwiGLUFFN
+
+
+ENCODER_VARIANTS = {
+    "vit-s": {
+        "dim": 384,
+        "depth": 12,
+        "heads": 6,
+    },
+    "vit-b": {
+        "dim": 768,
+        "depth": 12,
+        "heads": 12,
+    },
+    "vit-l": {
+        "dim": 1024,
+        "depth": 24,
+        "heads": 16,
+    },
+    "convnext-t": {
+        "backbone_dim": 768,
+    },
+    "convnext-s": {
+        "backbone_dim": 768,
+    },
+    "convnext-b": {
+        "backbone_dim": 1024,
+    },
+    "convnext-l": {
+        "backbone_dim": 1536,
+    },
+}
+
+
+def build_encoder_config(config: dict) -> dict:
+    arch = config.get("arch", "vit-s")
+    if arch not in ENCODER_VARIANTS:
+        raise ValueError(f"Unknown encoder arch: {arch}")
+
+    resolved = dict(ENCODER_VARIANTS[arch])
+    resolved.update(config)
+    resolved["arch"] = arch
+    return resolved
 
 
 class ViTBlock(nn.Module):
@@ -73,6 +116,8 @@ class ViT(nn.Module):
     def __init__(self, encoder_args) -> None:
         super().__init__()
 
+        encoder_args = build_encoder_config(encoder_args)
+
         self.dim = encoder_args["dim"]
         self.heads = encoder_args["heads"]
         self.depth = encoder_args["depth"]
@@ -135,3 +180,48 @@ class ViT(nn.Module):
         r, x = unpack(x, ps, "b * d")
 
         return {"register": r, "feature_map": x}
+
+
+class ConvNeXtEncoder(nn.Module):
+    _BACKBONES = {
+        "convnext-t": convnext_tiny,
+        "convnext-s": convnext_small,
+        "convnext-b": convnext_base,
+        "convnext-l": convnext_large,
+    }
+
+    def __init__(self, encoder_args) -> None:
+        super().__init__()
+
+        self.arch = encoder_args["arch"]
+        self.dim = encoder_args["dim"]
+        self.backbone_dim = encoder_args["backbone_dim"]
+
+        backbone = self._BACKBONES[self.arch](weights=None)
+        self.features = backbone.features
+        self.pool = backbone.avgpool
+
+        self.proj = nn.Identity()
+        if self.backbone_dim != self.dim:
+            self.proj = nn.Linear(self.backbone_dim, self.dim)
+
+    def forward(self, x):
+        x = rearrange(x, "b h w c -> b c h w")
+        feature_grid = self.features(x)
+        pooled = self.pool(feature_grid).flatten(1)
+        pooled = self.proj(pooled)
+        token = pooled.unsqueeze(1)
+        feature_map = rearrange(feature_grid, "b c h w -> b (h w) c")
+        feature_map = self.proj(feature_map)
+
+        return {"register": token, "feature_map": feature_map}
+
+
+def build_encoder(encoder_args):
+    encoder_args = build_encoder_config(encoder_args)
+    arch = encoder_args["arch"]
+    if arch.startswith("vit"):
+        return ViT(encoder_args)
+    if arch.startswith("convnext"):
+        return ConvNeXtEncoder(encoder_args)
+    raise ValueError(f"Unknown encoder arch: {arch}")

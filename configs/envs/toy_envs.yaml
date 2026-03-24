@@ -1,0 +1,40 @@
+seed: 0
+output_dir: data/toy_envs
+frame_size: [96, 96]
+
+envs:
+  pointmaze:
+    kind: pointmaze
+    env_id: PointMaze_UMaze-v3
+    train_episodes: 20000
+    val_episodes: 2000
+    max_steps: 32
+    action_repeat: 5  # 50 × 0.01s = 0.5s per step
+
+  push:
+    kind: push
+    env_id: FetchPush-v3
+    train_episodes: 20000
+    val_episodes: 2000
+    max_steps: 32
+
+  keydoor:
+    kind: keydoor
+    env_id: MiniGrid-DoorKey-16x16-v0
+    train_episodes: 20000
+    val_episodes: 2000
+    max_steps: 32
+    tile_size: 8
+
+  sokoban:
+    kind: sokoban
+    env_id: Sokoban-v1
+    train_episodes: 20000
+    val_episodes: 2000
+    max_steps: 32
+
+  craftax:
+    kind: craftax
+    train_episodes: 20000
+    val_episodes: 2000
+    max_steps: 32

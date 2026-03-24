@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-from einops import repeat
 from x_transformers import Decoder
 
 
@@ -13,10 +12,10 @@ class TransformerActionDecoder(torch.nn.Module):
 
         self.model = Decoder(
             dim=self.dim,
-            heads=8,
-            depth=4,
+            heads=int(config.get("heads", 8)),
+            depth=int(config.get("depth", 4)),
             ff_glu=True,
-            attn_flash=True,
+            attn_flash=bool(config.get("attn_flash", True)),
             rotary_pos_emb=True,
         )
         self.out_projection = nn.Linear(self.dim, self.action_dim)

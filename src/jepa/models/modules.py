@@ -9,9 +9,9 @@ class SwiGLUFFN(nn.Module):
         self.dim = dim
         self.hidden_dim = int(((dim * expansion * 2 / 3) // 8) * 8)
 
-        self.w1 = nn.Linear(self.dim, self.hidden_dim)
-        self.w2 = nn.Linear(self.dim, self.hidden_dim)
-        self.w3 = nn.Linear(self.hidden_dim, self.dim)
+        self.w1 = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.w2 = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.w3 = nn.Linear(self.hidden_dim, self.dim, bias=False)
 
     def forward(self, x):
         x = F.silu(self.w1(x)) * self.w2(x)
