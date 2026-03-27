@@ -6,6 +6,7 @@ slurm_out/
 temp_configs/
 experiments/
 claude.md
+figures/
 
 
 # Byte-compiled / optimized / DLL files
