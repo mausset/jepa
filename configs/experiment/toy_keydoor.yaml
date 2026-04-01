@@ -1,15 +1,19 @@
+# @package _global_
 encoder:
-  # arch: vit-s
-  # patch_size: 12
-  arch: convnext-t
+  # arch: convnext-t
+  arch: vit-t
+  patch_size: 12
   resolution: 96
-  # n_registers: 1
+  n_registers: 1
+  projector: true
+  projector_norm: none
 
 predictor:
   arch: vit-s
-  context: 12
-  noise_dim: 32
-  k: 16
+  fsq_levels: [8, 8]
+  context: 6
+  projector: true
+  projector_norm: none
 
 action_decoder:
   enabled: true
@@ -24,7 +28,7 @@ data:
   val_path: data/toy_envs/keydoor_val.h5
   include_actions: true
   photometric: false
-  crop: true
+  crop: false
   sequence_length: 12
   batch_size: 64
   num_workers: 8
@@ -36,8 +40,6 @@ training:
   warmup_steps: 1000
   total_steps: 50000
   lambda: 0.01
-  temp_mode: ess
-  temp: 0.01
   optimizer: muon
   lr_start: 1e-4
   lr: 3e-4

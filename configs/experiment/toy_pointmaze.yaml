@@ -1,0 +1,54 @@
+# @package _global_
+encoder:
+  arch: convnext-t
+  # arch: vit-s
+  # patch_size: 12
+  resolution: 96
+  # n_registers: 1
+  # projector: true
+  # projector_norm: bn
+
+predictor:
+  mode: residual
+  arch: vit-s
+  fsq_levels: [8,8]
+  context: 12
+  # projector: true
+  # projector_norm: bn
+
+action_decoder:
+  enabled: true
+  action_dim: 2
+  action_type: continuous
+  depth: 2
+  heads: 8
+
+data:
+  kind: toy_env
+  train_path: data/toy_envs/pointmaze_train.h5
+  val_path: data/toy_envs/pointmaze_val.h5
+  include_actions: true
+  photometric: true
+  crop: true
+  sequence_length: 12
+  batch_size: 64
+  num_workers: 8
+
+training:
+  project: jepa
+  seed: 42
+  distributed: false
+  warmup_steps: 1000
+  total_steps: 50000
+  lambda: 0.1
+  # sigreg_marginal: full
+  optimizer: muon
+  lr_start: 1e-4
+  lr: 3e-4
+  cooldown_frac: 0.2
+  final_lr_frac: 0.1
+  wd: 0.04
+  clip_grad: 10.0
+  val_fraction: 0.05
+  ckpt_fraction: 0.25
+  # wandb: disabled

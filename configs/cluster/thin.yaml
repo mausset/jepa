@@ -1,0 +1,11 @@
+slurm: true
+nodes: 1
+gpus_per_node: 1
+timeout_min: 900
+constraint: thin
+array_parallelism: 64
+setup_commands:
+  - "ls data/kinetics-dataset/k700-2020-processed-tars/*.tar | xargs -n1 -P8 -I{} tar -xf {} -C /scratch/local/"
+  - "module load gcc/system"
+  - "module load Mambaforge/23.3.1-1-hpc1-bdist"
+  - "mamba activate neodev"

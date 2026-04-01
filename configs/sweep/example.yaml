@@ -1,0 +1,16 @@
+seeds: 3
+params:
+  training:
+    lr: [1e-3, 3e-4, 1e-4]
+    lambda:
+      log2:
+        min: 0.01
+        n: 4
+        # -> [0.01, 0.02, 0.04, 0.08]
+    wd:
+      linspace:
+        min: 0.01
+        max: 0.1
+        n: 5
+  predictor:
+    context: [8, 12]

@@ -1,4 +1,3 @@
-from jepa.datasets.image_dataset import build_dali_iterators as build_image_iterators
 from jepa.datasets.toy_env_dataset import build_toy_env_iterators
 from jepa.datasets.video_dataset import build_dali_iterators as build_video_iterators
 
@@ -27,12 +26,8 @@ def build_iterators(
             world_size=world_size,
             seed=seed,
         )
-    if kind == "image":
-        return build_image_iterators(
-            config,
-            local_rank=local_rank,
-            global_rank=global_rank,
-            world_size=world_size,
-        )
+    if kind == "craftax_online":
+        from jepa.datasets.craftax_online import build_craftax_online_iterators
+        return build_craftax_online_iterators(config, seed=max(0, seed))
 
     raise ValueError(f"Unknown dataset kind: {kind}")

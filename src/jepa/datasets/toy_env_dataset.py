@@ -26,8 +26,53 @@ class SequenceSlice:
     start: int
 
 
+def _batched_adjust_hue(frames: torch.Tensor, hue_factors: torch.Tensor) -> torch.Tensor:
+    """Per-image hue shift. frames: (N, 3, H, W) float [0,1], hue_factors: (N,) in [-0.5, 0.5]."""
+    # RGB → HSV
+    maxc, argmax = frames.max(dim=1)
+    minc = frames.min(dim=1).values
+    cr = maxc - minc
+    r, g, b = frames[:, 0], frames[:, 1], frames[:, 2]
+
+    h = torch.zeros_like(maxc)
+    nz = cr > 0
+    m0 = nz & (argmax == 0)
+    m1 = nz & (argmax == 1)
+    m2 = nz & (argmax == 2)
+    h[m0] = ((g[m0] - b[m0]) / cr[m0]) % 6.0
+    h[m1] = (b[m1] - r[m1]) / cr[m1] + 2.0
+    h[m2] = (r[m2] - g[m2]) / cr[m2] + 4.0
+    h = h / 6.0
+
+    s = torch.where(maxc > 0, cr / maxc, torch.zeros_like(cr))
+    v = maxc
+
+    # shift hue per image
+    h = (h + hue_factors[:, None, None]) % 1.0
+
+    # HSV → RGB via sector lookup
+    c = v * s
+    hp = h * 6.0
+    x = c * (1.0 - (hp % 2.0 - 1.0).abs())
+    m = v - c
+    hi = hp.long() % 6
+
+    zeros = torch.zeros_like(c)
+    r_lut = torch.stack([c, x, zeros, zeros, x, c])  # (6, N, H, W)
+    g_lut = torch.stack([x, c, c, x, zeros, zeros])
+    b_lut = torch.stack([zeros, zeros, x, c, c, x])
+    idx = hi.unsqueeze(0)                              # (1, N, H, W)
+    return torch.stack([
+        r_lut.gather(0, idx).squeeze(0) + m,
+        g_lut.gather(0, idx).squeeze(0) + m,
+        b_lut.gather(0, idx).squeeze(0) + m,
+    ], dim=1)
+
+
 class ToyEnvAugmentation:
     def __init__(self, photometric: str = "false", crop: bool = False):
+        from torchvision.transforms import v2
+
         self.photometric = str(photometric).lower()
         self.crop = bool(crop)
         if self.photometric not in {"false", "true", "per_frame"}:
@@ -40,6 +85,13 @@ class ToyEnvAugmentation:
         self.saturation = 0.2
         self.hue = 0.1
 
+        self._color_jitter = v2.ColorJitter(
+            brightness=self.brightness,
+            contrast=self.contrast,
+            saturation=self.saturation,
+            hue=self.hue,
+        )
+
     def __call__(self, frames: torch.Tensor) -> torch.Tensor:
         if not self.crop and self.photometric == "false":
             return frames
@@ -48,9 +100,10 @@ class ToyEnvAugmentation:
         if self.crop:
             frames = self._random_resized_crop(frames)
         if self.photometric == "true":
-            frames = self._photometric_jitter(frames)
+            # v2.ColorJitter applies same params to all frames — consistent jitter
+            frames = self._color_jitter(frames)
         elif self.photometric == "per_frame":
-            frames = torch.stack([self._photometric_jitter(f.unsqueeze(0)).squeeze(0) for f in frames])
+            frames = self._photometric_jitter_per_frame(frames)
         return frames.permute(0, 2, 3, 1).contiguous()
 
     def _random_resized_crop(self, frames: torch.Tensor) -> torch.Tensor:
@@ -71,13 +124,20 @@ class ToyEnvAugmentation:
             antialias=True,
         )
 
-    def _photometric_jitter(self, frames: torch.Tensor) -> torch.Tensor:
-        hue = (torch.rand(1).item() * 2.0 - 1.0) * self.hue
-        frames = tvf.adjust_hue(frames, hue)
+    def _photometric_jitter_per_frame(self, frames: torch.Tensor) -> torch.Tensor:
+        """Vectorized per-frame photometric jitter. frames: (T, C, H, W)."""
+        T = frames.shape[0]
+        dev = frames.device
 
-        brightness = 1.0 + (torch.rand(1).item() * 2.0 - 1.0) * self.brightness
-        contrast = 1.0 + (torch.rand(1).item() * 2.0 - 1.0) * self.contrast
-        saturation = 1.0 + (torch.rand(1).item() * 2.0 - 1.0) * self.saturation
+        # per-frame hue via batched RGB→HSV→RGB
+        hues = (torch.rand(T, device=dev) * 2.0 - 1.0) * self.hue
+        frames = _batched_adjust_hue(frames, hues)
+
+        # per-frame brightness / contrast / saturation as (T, 1, 1, 1)
+        shape = (T, 1, 1, 1)
+        brightness = 1.0 + (torch.rand(shape, device=dev) * 2.0 - 1.0) * self.brightness
+        contrast = 1.0 + (torch.rand(shape, device=dev) * 2.0 - 1.0) * self.contrast
+        saturation = 1.0 + (torch.rand(shape, device=dev) * 2.0 - 1.0) * self.saturation
 
         frames = frames * brightness
 
@@ -88,7 +148,6 @@ class ToyEnvAugmentation:
         frames = gray + saturation * (frames - gray)
 
         return frames.clamp_(0.0, 1.0)
-
 
 class ToyEnvSequenceDataset(Dataset):
     def __init__(

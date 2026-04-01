@@ -1,30 +1,33 @@
+# @package _global_
 encoder:
-  arch: vit-s
-  patch_size: 12
-  # arch: resnet18
+  arch: convnext-t
+  # arch: vit-s
+  # patch_size: 12
   resolution: 96
-  n_registers: 1
+  # n_registers: 1
 
 predictor:
+  mode: residual
   arch: vit-s
+  fsq_levels: [8, 8]
   context: 12
-  noise_dim: 32
-  k: 16
+  # projector: true
+  # projector_norm: bn
 
 action_decoder:
   enabled: true
-  action_dim: 4
-  action_type: continuous
+  action_dim: 9
+  action_type: discrete
   depth: 2
   heads: 8
 
 data:
   kind: toy_env
-  train_path: data/toy_envs/push_train.h5
-  val_path: data/toy_envs/push_val.h5
+  train_path: data/toy_envs/sokoban_train.h5
+  val_path: data/toy_envs/sokoban_val.h5
   include_actions: true
   photometric: true
-  crop: false
+  crop: true
   sequence_length: 12
   batch_size: 64
   num_workers: 8
@@ -35,9 +38,7 @@ training:
   distributed: false
   warmup_steps: 1000
   total_steps: 50000
-  lambda: 0.01
-  temp_mode: fixed
-  temp: 0.01
+  lambda: 0.1
   optimizer: muon
   lr_start: 1e-4
   lr: 3e-4

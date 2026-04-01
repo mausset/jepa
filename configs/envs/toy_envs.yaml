@@ -9,7 +9,7 @@ envs:
     train_episodes: 20000
     val_episodes: 2000
     max_steps: 32
-    action_repeat: 5  # 50 × 0.01s = 0.5s per step
+    action_repeat: 15  # 50 × 0.01s = 0.5s per step
 
   push:
     kind: push
@@ -17,6 +17,7 @@ envs:
     train_episodes: 20000
     val_episodes: 2000
     max_steps: 32
+    action_repeat: 10
 
   keydoor:
     kind: keydoor
@@ -32,6 +33,13 @@ envs:
     train_episodes: 20000
     val_episodes: 2000
     max_steps: 32
+
+  pusht:
+    kind: pusht
+    train_episodes: 20000
+    val_episodes: 2000
+    max_steps: 32
+    max_delta: 1.0
 
   craftax:
     kind: craftax

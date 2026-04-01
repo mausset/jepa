@@ -1,4 +1,4 @@
-
+# @package _global_
 encoder:
   arch: vit-s
   patch_size: 14
@@ -16,7 +16,7 @@ data:
   val_root: data/walking_tours/240p_hevc_ext_val/
   sequence_length: 8
   photometric: false
-  crop_aspect: True
+  crop_aspect: true
   stride: 1
   step: 1
   resolution: 224

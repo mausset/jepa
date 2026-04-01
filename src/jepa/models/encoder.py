@@ -2,13 +2,24 @@ import torch
 import torch.nn.functional as F
 from einops import pack, rearrange, repeat, unpack
 from einops.layers.torch import Rearrange
+from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 from torch import nn
-from torchvision.models import convnext_base, convnext_large, convnext_small, convnext_tiny
+from torchvision.models import (
+    convnext_base,
+    convnext_large,
+    convnext_small,
+    convnext_tiny,
+)
 
 from jepa.models.modules import SwiGLUFFN
 
 
 ENCODER_VARIANTS = {
+    "vit-t": {
+        "dim": 192,
+        "depth": 12,
+        "heads": 3,
+    },
     "vit-s": {
         "dim": 384,
         "depth": 12,
@@ -50,6 +61,30 @@ def build_encoder_config(config: dict) -> dict:
     return resolved
 
 
+class MLPProjector(nn.Module):
+    def __init__(self, dim, expansion=4, norm="bn"):
+        super().__init__()
+        hidden = dim * expansion
+        self.fc1 = nn.Linear(dim, hidden)
+        if norm == "bn":
+            self.norm = nn.BatchNorm1d(hidden)
+        elif norm == "ln":
+            self.norm = nn.LayerNorm(hidden)
+        elif norm in (None, "none"):
+            self.norm = nn.Identity()
+        else:
+            raise ValueError(f"Unknown projector norm: {norm}")
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden, dim)
+
+    def forward(self, x):
+        shape = x.shape
+        x = self.fc1(x.reshape(-1, shape[-1]))
+        x = self.act(self.norm(x))
+        x = self.fc2(x)
+        return x.reshape(shape)
+
+
 class ViTBlock(nn.Module):
     HEAD_DIM = 64
 
@@ -66,11 +101,8 @@ class ViTBlock(nn.Module):
 
         self.attn_out = nn.Linear(self.attn_dim, self.dim, bias=False)
 
-        self.norm_q = nn.RMSNorm(self.HEAD_DIM)
-        self.norm_k = nn.RMSNorm(self.HEAD_DIM)
-
-        self.norm_attn = nn.RMSNorm(self.dim)
-        self.norm_ffn = nn.RMSNorm(self.dim)
+        self.norm_attn = nn.LayerNorm(self.dim)
+        self.norm_ffn = nn.LayerNorm(self.dim)
 
         self.ffn = SwiGLUFFN(dim, expansion=expansion)
 
@@ -87,7 +119,7 @@ class ViTBlock(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-    def forward(self, x):
+    def forward(self, x, freqs=None, n_registers=0):
         B, N, D = x.shape
 
         x_pre_attn = x
@@ -97,8 +129,13 @@ class ViTBlock(nn.Module):
         k = rearrange(self.to_k(x), "b n (h d) -> b h n d", h=self.heads)
         v = rearrange(self.to_v(x), "b n (h d) -> b h n d", h=self.heads)
 
-        q = self.norm_q(q)
-        k = self.norm_k(k)
+        if freqs is not None:
+            q_reg, q_patch = q[:, :, :n_registers], q[:, :, n_registers:]
+            k_reg, k_patch = k[:, :, :n_registers], k[:, :, n_registers:]
+            q_patch = apply_rotary_emb(freqs, q_patch)
+            k_patch = apply_rotary_emb(freqs, k_patch)
+            q = torch.cat([q_reg, q_patch], dim=2)
+            k = torch.cat([k_reg, k_patch], dim=2)
 
         with nn.attention.sdpa_kernel(self.sdpa_list):
             attn_output = F.scaled_dot_product_attention(q, k, v)
@@ -113,6 +150,8 @@ class ViTBlock(nn.Module):
 
 
 class ViT(nn.Module):
+    HEAD_DIM = 64
+
     def __init__(self, encoder_args) -> None:
         super().__init__()
 
@@ -126,10 +165,12 @@ class ViT(nn.Module):
 
         self.resolution = encoder_args["resolution"]
         self.patch_size = encoder_args["patch_size"]
-        self.n_patches = (self.resolution // self.patch_size) ** 2
+        self.grid_size = self.resolution // self.patch_size
+        self.n_patches = self.grid_size**2
 
-        self.pe = nn.Parameter(torch.zeros(1, self.n_patches, self.dim))
-        nn.init.trunc_normal_(self.pe, std=0.02)
+        # Axial RoPE (DINOv3-style: D_head//4 per axis, tiled 2x, theta=100)
+        self.rope_h = RotaryEmbedding(self.HEAD_DIM // 4, theta=100.0)
+        self.rope_w = RotaryEmbedding(self.HEAD_DIM // 4, theta=100.0)
 
         self.registers = nn.Parameter(torch.zeros(self.n_registers, self.dim))
         nn.init.trunc_normal_(self.registers, std=0.02)
@@ -147,18 +188,32 @@ class ViT(nn.Module):
         self.blocks = nn.ModuleList(
             [ViTBlock(self.dim, self.heads) for _ in range(self.depth)]
         )
+        self.projector = (
+            MLPProjector(self.dim, norm=encoder_args.get("projector_norm", "none"))
+            if encoder_args.get("projector", False)
+            else nn.Identity()
+        )
+
+    def _axial_freqs(self, device):
+        g = self.grid_size
+        rows = torch.arange(g, device=device).float().repeat_interleave(g)
+        cols = torch.arange(g, device=device).float().repeat(g)
+        freqs_h = self.rope_h(rows)  # (g*g, HEAD_DIM//4)
+        freqs_w = self.rope_w(cols)  # (g*g, HEAD_DIM//4)
+        freqs = torch.cat([freqs_h, freqs_w], dim=-1)  # (g*g, HEAD_DIM//2)
+        return freqs.tile(2)  # (g*g, HEAD_DIM)
 
     def forward_features(self, x):
         B, *_ = x.shape
 
         x = self.patch_embed(x)
-        x = x + self.pe
+        freqs = self._axial_freqs(x.device)
 
         r = repeat(self.registers, "n d -> b n d", b=B)
         x, ps = pack((r, x), "b * d")
 
         for layer in self.blocks[:-1]:
-            x = layer(x)
+            x = layer(x, freqs=freqs, n_registers=self.n_registers)
 
         r, x = unpack(x, ps, "b * d")
 
@@ -167,17 +222,18 @@ class ViT(nn.Module):
     def forward(self, x):
         B, *_ = x.shape
 
-        pe = self.pe
         x = self.patch_embed(x)
-        x = x + pe
+        freqs = self._axial_freqs(x.device)
 
         r = repeat(self.registers, "n d -> b n d", b=B)
         x, ps = pack((r, x), "b * d")
 
         for layer in self.blocks:
-            x = layer(x)
+            x = layer(x, freqs=freqs, n_registers=self.n_registers)
 
         r, x = unpack(x, ps, "b * d")
+        r = self.projector(r)
+        x = self.projector(x)
 
         return {"register": r, "feature_map": x}
 
@@ -205,14 +261,20 @@ class ConvNeXtEncoder(nn.Module):
         if self.backbone_dim != self.dim:
             self.proj = nn.Linear(self.backbone_dim, self.dim)
 
+        self.projector = (
+            MLPProjector(self.dim, norm=encoder_args.get("projector_norm", "none"))
+            if encoder_args.get("projector", False)
+            else nn.Identity()
+        )
+
     def forward(self, x):
         x = rearrange(x, "b h w c -> b c h w")
         feature_grid = self.features(x)
         pooled = self.pool(feature_grid).flatten(1)
         pooled = self.proj(pooled)
-        token = pooled.unsqueeze(1)
+        token = self.projector(pooled).unsqueeze(1)
         feature_map = rearrange(feature_grid, "b c h w -> b (h w) c")
-        feature_map = self.proj(feature_map)
+        feature_map = self.projector(self.proj(feature_map))
 
         return {"register": token, "feature_map": feature_map}
 

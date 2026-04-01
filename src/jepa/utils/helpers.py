@@ -151,36 +151,6 @@ def compute_alpha(eigvals, min_idx=0, max_idx=None):
     slope = num / (den + 1e-8)
     return -slope.item()  # Alpha is negative slope
 
-
-def mi_proxy(lambdas, eps=1e-6, base2=False):
-    """
-    Gaussian MI proxy from correlation eigenvalues.
-
-    I = -1/2 * sum_i log(1 - lambda_i^2)
-
-    Args:
-        lambdas: 1D tensor (d,) or anything broadcastable to that.
-        eps: small number to keep |lambda| < 1 for numerical stability.
-        base2: if True, return MI in bits (otherwise in nats).
-
-    Returns:
-        Scalar tensor: mutual information proxy.
-    """
-    lambdas = torch.as_tensor(lambdas)
-
-    # Clamp to avoid log(0) and invalid values when |lambda| >= 1
-    lambdas = torch.clamp(lambdas, min=-1 + eps, max=1 - eps)
-
-    mi_nats = -0.5 * torch.log(1.0 - lambdas**2).sum()
-
-    if base2:
-        mi_nats = mi_nats / torch.log(
-            torch.tensor(2.0, device=mi_nats.device, dtype=mi_nats.dtype)
-        )
-
-    return mi_nats
-
-
 class MeanMetric:
     def __init__(self):
         self.reset()

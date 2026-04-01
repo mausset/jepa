@@ -168,6 +168,80 @@ class PushEnv(GymToyEnv):
         super().__init__(merged)
 
 
+class PushTEnv(ToyEnv):
+    def __init__(self, config: dict):
+        try:
+            import gymnasium as gym
+            import gym_pusht  # noqa: F401
+        except ImportError as exc:
+            raise ImportError("gym-pusht is required for the push-t toy environment.") from exc
+
+        self.frame_size = tuple(config.get("frame_size", (96, 96)))
+        self.env_id = config.get("env_id", "gym_pusht/PushT-v0")
+        self.action_repeat = int(config.get("action_repeat", 1))
+
+        self.env = gym.make(self.env_id, render_mode="rgb_array")
+        self.last_obs = None
+
+        self._act_low = np.asarray(self.env.action_space.low, dtype=np.float32)
+        self._act_high = np.asarray(self.env.action_space.high, dtype=np.float32)
+        self._max_delta = float(config.get("max_delta", 0.15))
+
+        super().__init__(action_type="continuous", action_dim=int(np.prod(self.env.action_space.shape)))
+
+    def _normalize_action(self, action):
+        """Map from env range to [-1, 1]."""
+        return 2.0 * (action - self._act_low) / (self._act_high - self._act_low) - 1.0
+
+    def _denormalize_action(self, action):
+        """Map from [-1, 1] to env range."""
+        return (action + 1.0) / 2.0 * (self._act_high - self._act_low) + self._act_low
+
+    def reset(self, rng: np.random.Generator):
+        seed = int(rng.integers(0, 2**31 - 1))
+        self.last_obs, _ = self.env.reset(seed=seed)
+
+    def sample_action(self, rng: np.random.Generator):
+        delta = rng.uniform(-self._max_delta, self._max_delta, size=self.action_dim).astype(np.float32)
+        if self.last_obs is not None:
+            obs = np.asarray(self.last_obs, dtype=np.float32).reshape(-1)
+            current = self._normalize_action(obs[:self.action_dim])
+            return np.clip(current + delta, -1.0, 1.0)
+        return np.clip(delta, -1.0, 1.0)
+
+    def step(self, action):
+        env_action = self._denormalize_action(np.asarray(action, dtype=np.float32))
+        done = False
+        for _ in range(self.action_repeat):
+            self.last_obs, _, terminated, truncated, _ = self.env.step(env_action)
+            done = done or bool(terminated or truncated)
+            if done:
+                break
+        return done
+
+    def render(self, frame_size: tuple[int, int]) -> np.ndarray:
+        frame = np.asarray(self.env.render(), dtype=np.uint8)
+        if frame.shape[:2] == frame_size:
+            return frame
+        height, width = frame_size
+        ys = np.linspace(0, frame.shape[0] - 1, height).astype(np.int64)
+        xs = np.linspace(0, frame.shape[1] - 1, width).astype(np.int64)
+        return np.asarray(frame[np.ix_(ys, xs)], dtype=np.uint8)
+
+    def state_vector(self) -> np.ndarray:
+        if self.last_obs is None:
+            raise RuntimeError("Environment must be reset before reading state.")
+        obs = self.last_obs
+        if isinstance(obs, dict):
+            return np.concatenate([
+                np.asarray(v, dtype=np.float32).reshape(-1) for v in obs.values()
+            ])
+        return np.asarray(obs, dtype=np.float32).reshape(-1)
+
+    def close(self):
+        self.env.close()
+
+
 class KeyDoorEnv(ToyEnv):
     def __init__(self, config: dict):
         try:
@@ -399,6 +473,8 @@ def build_toy_env(config: dict) -> ToyEnv:
         return PointMazeEnv(config)
     if kind == "push":
         return PushEnv(config)
+    if kind == "pusht":
+        return PushTEnv(config)
     if kind == "keydoor":
         return KeyDoorEnv(config)
     if kind == "sokoban":

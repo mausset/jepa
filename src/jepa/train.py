@@ -3,11 +3,9 @@ import itertools
 import os
 import random
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import yaml
 from einops import rearrange
 from pytorch_optimizer import Muon
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -15,7 +13,7 @@ from tqdm import tqdm
 
 import wandb
 from jepa.datasets.builder import build_iterators
-from jepa.losses.lejepa import EppsPulley, SlicingUnivariateTest
+from jepa.losses.sigreg import EppsPulley, SlicingUnivariateTest
 from jepa.models.jepa import JEPA
 from jepa.utils.distributed import setup_distributed
 from jepa.utils.helpers import MeanMetric, rankme, spectrum
@@ -65,11 +63,20 @@ def compute_training_metrics(result):
     metrics = {}
 
     metrics["state_norm"] = result["state"].norm(dim=-1).mean()
-    metrics["pred_norm"] = result["pred"].norm(dim=-1).mean()
+    pred = result["pred"] if result["pred"] is not None else result["pred_cond"]
+    if pred is not None:
+        metrics["pred_norm"] = pred.norm(dim=-1).mean()
 
     state = rearrange(result["state"], "... d -> (...) d")
     eigvals = spectrum(state.float())
     metrics["rankme"] = rankme(eigvals)
+
+    # temporal latent path straightness (Eq. 9, LeWorldModel)
+    z = result["state"].float()  # (B, T, N, D)
+    v = z[:, 1:] - z[:, :-1]  # (B, T-1, N, D)
+    if v.shape[1] >= 2:
+        cos = F.cosine_similarity(v[:, :-1], v[:, 1:], dim=-1)  # (B, T-2, N)
+        metrics["path_straightness"] = cos.mean()
 
     return metrics
 
@@ -134,60 +141,11 @@ def get_loss_fn(config):
     stats_test = EppsPulley()
     loss_fn = SlicingUnivariateTest(stats_test, 1024)
     action_config = config.get("action_decoder", {})
-    training_config = config["training"]
     action_enabled = bool(action_config.get("enabled", False))
     action_type = action_config.get("action_type", "continuous")
-    loss_type = training_config.get("loss", "free_energy")
-    temp_mode = training_config.get("temp_mode", "fixed")
-    fixed_temp = float(training_config.get("temp", 0.01))
-    target_ess = float(training_config.get("target_ess", 0.5))
-
-    if loss_type not in {"free_energy", "imle"}:
-        raise ValueError(f"Unknown loss type: {loss_type}")
-    if temp_mode not in {"fixed", "ess", "profiled"}:
-        raise ValueError(f"Unknown temp_mode: {temp_mode}")
-    if fixed_temp <= 0:
-        raise ValueError("training.temp must be positive.")
-
-    def find_temperature_ess(dist, target_ess=0.5, T_lo=1e-5, T_hi=1.0, n_iter=20):
-        K = dist.shape[0]
-        lo = dist.new_full(dist.shape[1:], T_lo)
-        hi = dist.new_full(dist.shape[1:], T_hi)
-
-        for _ in range(n_iter):
-            mid = (lo + hi) / 2
-            w = torch.softmax(-dist / mid.unsqueeze(0), dim=0)
-            ess = 1.0 / (w.pow(2).sum(dim=0) * K)
-            lo = torch.where(ess < target_ess, mid, lo)
-            hi = torch.where(ess >= target_ess, mid, hi)
-
-        return (lo + hi) / 2
-
-    def find_temperature_profiled(dist, n_iter=10):
-        T = 2.0 * dist.mean(dim=0).clamp(min=1e-8)
-        for _ in range(n_iter):
-            w = torch.softmax(-dist / T.unsqueeze(0), dim=0)
-            T = 2.0 * (w * dist).sum(dim=0).clamp(min=1e-8)
-        return T.detach()
-
-    def free_energy(pred, target):
-        dist = (target.float().unsqueeze(0) - pred.float()).pow(2).mean(dim=(-1, -2))
-        if temp_mode == "ess":
-            temp = find_temperature_ess(dist, target_ess=target_ess)
-        elif temp_mode == "profiled":
-            temp = find_temperature_profiled(dist)
-        else:
-            temp = dist.new_full(dist.shape[1:], fixed_temp)
-        w = torch.softmax(-dist / temp.unsqueeze(0), dim=0).detach()
-        fe = (w * dist).sum(dim=0).mean()
-        return fe, w, temp
-
-    def imle(pred, target):
-        dist = (target.unsqueeze(0) - pred).pow(2).mean(dim=-1)
-        idx = dist.mean(dim=-1).argmin(dim=0)
-        w = torch.zeros_like(dist)
-        w[idx, torch.arange(dist.shape[1], device=dist.device)] = 1.0
-        return (w * dist).sum(dim=0).mean(), w
+    sigreg_marginal = config.get("training", {}).get("sigreg_marginal", "full")
+    predictor_mode = config.get("predictor", {}).get("mode", "mean")
+    detach_cond_target = config.get("training", {}).get("detach_cond_target", False)
 
     def compute_action_loss(result, actions):
         if not action_enabled:
@@ -229,47 +187,62 @@ def get_loss_fn(config):
 
         raise ValueError(f"Unknown action decoder type: {action_type}")
 
+    def compute_rollout_diagnostic(result, actions):
+        if not action_enabled or actions is None:
+            return {}
+        pred = result.get("rollout_action_pred")
+        if pred is None:
+            return {}
+        if action_type == "discrete":
+            target = actions.long()
+            logits = rearrange(pred, "b t c -> (b t) c")
+            target = rearrange(target, "b t -> (b t)")
+            acc = (logits.argmax(dim=-1) == target).float().mean()
+            return {"rollout_action_acc": acc}
+        if action_type == "continuous":
+            target = actions.to(dtype=pred.dtype)
+            return {"rollout_action_l1": F.l1_loss(pred, target)}
+        return {}
+
     def compute_loss(result, actions, step):
         lam = config["training"]["lambda"]
+        target = result["state"][:, 1:].float()
 
-        target = rearrange(result["state"][:, 1:], "... n d -> (...) n d").float()
-        pred = rearrange(result["pred"], "k b t n d -> k (b t) n d").float()
-
-        if loss_type == "free_energy":
-            mse_loss, w, t = free_energy(pred, target)
+        # sigreg on encoder states
+        if sigreg_marginal == "time":
+            state = rearrange(result["state"], "b t n d -> t n b d")
         else:
-            mse_loss, w = imle(pred, target)
-
-        min_mse = (
-            (target.unsqueeze(0) - pred)
-            .pow(2)
-            .mean(dim=(-1, -2))
-            .min(dim=0)
-            .values.mean()
-        )
-
-        h = torch.special.entr(w).sum(dim=0) / np.log(config["predictor"]["k"])
-        ess = 1.0 / (w.pow(2).sum(dim=0) * w.shape[0])
-
-        state = rearrange(result["state"], "... d -> (...) d")
+            state = rearrange(result["state"], "... d -> (...) d").unsqueeze(0)
         state_sigreg_loss = loss_fn(state.float())
+        total_loss = lam * state_sigreg_loss
+        loss_dict = {"state_sigreg": state_sigreg_loss}
 
-        total_loss = lam * state_sigreg_loss + (1 - lam) * mse_loss
+        # mean predictor MSE
+        if result["pred"] is not None:
+            mse_loss = F.mse_loss(result["pred"].float(), target)
+            total_loss = total_loss + mse_loss
+            loss_dict["mse"] = mse_loss
+
+        # latent predictor MSE
+        if result["pred_cond"] is not None:
+            if predictor_mode == "residual":
+                mean_pred = result["pred"].detach()
+                cond_mse_loss = F.mse_loss(
+                    result["pred_cond"].float() - mean_pred, target - mean_pred
+                )
+            else:
+                cond_target = target.detach() if detach_cond_target else target
+                cond_mse_loss = F.mse_loss(result["pred_cond"].float(), cond_target)
+            total_loss = total_loss + cond_mse_loss
+            loss_dict["cond_mse"] = cond_mse_loss
+
         action_metrics = compute_action_loss(result, actions)
         if action_metrics:
             total_loss = total_loss + action_metrics["action"]
 
-        loss_dict = {
-            "total": total_loss,
-            "state_sigreg": state_sigreg_loss,
-            "mse": mse_loss,
-            "min_mse": min_mse,
-            "h": h.mean(),
-            "ess": ess.mean(),
-        }
-        if loss_type == "free_energy":
-            loss_dict["t"] = t.mean()
+        loss_dict["total"] = total_loss
         loss_dict.update(action_metrics)
+        loss_dict.update(compute_rollout_diagnostic(result, actions))
         return loss_dict
 
     return compute_loss
@@ -290,10 +263,11 @@ def log_progress(
     if pbar is not None:
         postfix = dict(
             state_sigreg=scalar_loss["state_sigreg"].item(),
-            mse=scalar_loss["mse"].item(),
-            h=scalar_loss["h"].item(),
-            ess=scalar_loss["ess"].item(),
         )
+        if "mse" in scalar_loss:
+            postfix["mse"] = scalar_loss["mse"].item()
+        if "cond_mse" in scalar_loss:
+            postfix["cond_mse"] = scalar_loss["cond_mse"].item()
         if "action" in scalar_loss:
             postfix["action"] = scalar_loss["action"].item()
         if "action_acc" in scalar_loss:
@@ -360,6 +334,7 @@ def init_opt(config, model):
             "pe",
             "registers",
             "token",
+            "projector",
         ]
         muon_group = [
             p
@@ -514,8 +489,9 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Checkpoint to resume")
     args = parser.parse_args()
 
-    with open(args.config, "r") as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
+    from omegaconf import OmegaConf
+
+    config = OmegaConf.to_container(OmegaConf.load(args.config), resolve=True)
 
     # torch.autograd.set_detect_anomaly(True)
 
