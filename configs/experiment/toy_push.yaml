@@ -33,7 +33,6 @@ data:
 training:
   project: jepa
   seed: 42
-  distributed: false
   warmup_steps: 1000
   total_steps: 50000
   lambda: 0.01

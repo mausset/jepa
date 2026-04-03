@@ -27,7 +27,6 @@ training:
   project: jepa
   seed: 42
   loss: mse
-  distributed: true
   warmup_steps: 2000
   total_steps: 100000
   lambda: 0.01

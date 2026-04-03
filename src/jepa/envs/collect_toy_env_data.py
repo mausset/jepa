@@ -128,6 +128,8 @@ def _collect_craftax_batch(num_episodes, max_steps, frame_size, seed, batch_size
 
         return frames, states_out, all_actions, ep_lengths
 
+    print(f"Craftax collection using JAX backend: {jax.default_backend()}")
+
     all_episodes = []
     remaining = num_episodes
     key = jax.random.PRNGKey(seed)

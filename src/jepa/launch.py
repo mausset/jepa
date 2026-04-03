@@ -303,18 +303,15 @@ def _run_local(workdir, cluster, jobs_info, sweep_name):
         env = os.environ.copy()
         env.setdefault("WANDB_RUN_GROUP", sweep_name)
 
-        if gpus > 1:
-            port = find_free_port()
-            cmd = [
-                "torchrun",
-                "--nproc-per-node", str(gpus),
-                "--rdzv-backend", "c10d",
-                "--rdzv-endpoint", f"localhost:{port}",
-                "-m", "jepa.train",
-                "--config", str(cfg_path),
-            ]
-        else:
-            cmd = [sys.executable, "-m", "jepa.train", "--config", str(cfg_path)]
+        port = find_free_port()
+        cmd = [
+            "torchrun",
+            "--nproc-per-node", str(gpus),
+            "--rdzv-backend", "c10d",
+            "--rdzv-endpoint", f"localhost:{port}",
+            "-m", "jepa.train",
+            "--config", str(cfg_path),
+        ]
 
         proc = subprocess.run(cmd, cwd=workdir, env=env)
         if proc.returncode != 0:

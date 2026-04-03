@@ -90,9 +90,8 @@ class JEPA(nn.Module):
             pooled_state = state.mean(dim=2).detach()
             action_pred = self.action_decoder(pooled_state)[:, 1:]
 
-            with torch.no_grad():
-                imagined = torch.cat([state[:, :1], rollout_source], dim=1).detach()
-                rollout_action_pred = self.action_decoder(imagined.mean(dim=2))[:, 1:]
+            imagined = torch.cat([state[:, :1], rollout_source], dim=1).detach()
+            rollout_action_pred = self.action_decoder(imagined.mean(dim=2))[:, 1:].detach()
 
         return {
             "pred": pred,

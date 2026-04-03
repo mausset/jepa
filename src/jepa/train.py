@@ -10,6 +10,7 @@ from einops import rearrange
 from pytorch_optimizer import Muon
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
+from omegaconf import OmegaConf
 
 import wandb
 from jepa.datasets.builder import build_iterators
@@ -489,8 +490,6 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Checkpoint to resume")
     args = parser.parse_args()
 
-    from omegaconf import OmegaConf
-
     config = OmegaConf.to_container(OmegaConf.load(args.config), resolve=True)
 
     # torch.autograd.set_detect_anomaly(True)
@@ -499,7 +498,6 @@ def main():
     data_conf = config["data"]
 
     seed = train_conf.get("seed", -1)
-    dist_enabled = train_conf.get("distributed", False)
     wandb_mode = train_conf.get("wandb", "online")
 
     torch.manual_seed(seed)
@@ -511,14 +509,10 @@ def main():
         config.get("action_decoder"),
     )
 
-    local_rank, global_rank, world_size = 0, 0, 1
-    if dist_enabled:
-        local_rank, global_rank, world_size = setup_distributed()
-        model = model.to(local_rank)
-        model = DDP(model, device_ids=[local_rank])  # , find_unused_parameters=True)
-        model.compile(mode="default")
-    else:
-        model = model.cuda()
+    local_rank, global_rank, world_size = setup_distributed()
+    model = model.to(local_rank)
+    model = DDP(model, device_ids=[local_rank])
+    model = torch.compile(model)
 
     loss_fn = get_loss_fn(config)
 
@@ -549,9 +543,8 @@ def main():
         rank=global_rank,
     )
 
-    if dist_enabled:
-        torch.cuda.empty_cache()
-        dist.destroy_process_group()
+    torch.cuda.empty_cache()
+    dist.destroy_process_group()
 
     print("Finished training")
 

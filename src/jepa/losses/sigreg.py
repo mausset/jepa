@@ -11,7 +11,7 @@ def is_dist_avail_and_initialized():
 
 
 def maybe_all_reduce(x, op=ReduceOp.AVG):
-    if is_dist_avail_and_initialized():
+    if is_dist_avail_and_initialized() and dist.get_world_size() > 1:
         return all_reduce(x, op)
     else:
         return x

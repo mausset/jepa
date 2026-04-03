@@ -120,6 +120,9 @@ class CraftaxOnlineBatchIterator:
         self._collect = _collect
         self._key = jax.random.PRNGKey(seed)
 
+        backend = jax.default_backend()
+        print(f"Craftax online using JAX backend: {backend}")
+
         # normalisation tensors moved to device on first use
         self._mean: torch.Tensor | None = None
         self._std: torch.Tensor | None = None

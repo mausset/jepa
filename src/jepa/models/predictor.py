@@ -252,10 +252,18 @@ class Predictor(nn.Module):
                 nn.Linear(self.dim, self.dim),
             )
 
-        # --- predictor half (AdaLN, causal block attention) ---
-        self.pred_blocks = nn.ModuleList(
-            [PredictorBlock(self.dim, self.heads, self.rope) for _ in range(pred_depth)]
-        )
+        # --- predictor half ---
+        self.conditioning = predictor_args.get("conditioning", "adaln")
+        if self.conditioning == "adaln":
+            self.pred_blocks = nn.ModuleList(
+                [PredictorBlock(self.dim, self.heads, self.rope) for _ in range(pred_depth)]
+            )
+        elif self.conditioning == "add":
+            self.pred_blocks = nn.ModuleList(
+                [PlainBlock(self.dim, self.heads, self.rope) for _ in range(pred_depth)]
+            )
+        else:
+            raise ValueError(f"Unknown conditioning type: {self.conditioning}")
         proj_norm = predictor_args.get("projector_norm", "none")
         use_proj = predictor_args.get("projector", False)
         self.projector = (
@@ -271,8 +279,13 @@ class Predictor(nn.Module):
         return x
 
     def _pred_half(self, x, latent, attn_mask):
-        for block in self.pred_blocks:
-            x = block(x, latent, attn_mask=attn_mask)
+        if self.conditioning == "add":
+            x = x + latent
+            for block in self.pred_blocks:
+                x = block(x, attn_mask=attn_mask)
+        else:
+            for block in self.pred_blocks:
+                x = block(x, latent, attn_mask=attn_mask)
         x = self.projector(x)
         return x
 
