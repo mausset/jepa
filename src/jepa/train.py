@@ -1,7 +1,10 @@
 import argparse
 import itertools
+import json
 import os
 import random
+import subprocess
+import time
 
 import torch
 import torch.distributed as dist
@@ -221,7 +224,6 @@ def get_loss_fn(config):
         # mean predictor MSE
         if result["pred"] is not None:
             mse_loss = F.mse_loss(result["pred"].float(), target)
-            total_loss = total_loss + mse_loss
             loss_dict["mse"] = mse_loss
 
         # latent predictor MSE
@@ -231,11 +233,14 @@ def get_loss_fn(config):
                 cond_mse_loss = F.mse_loss(
                     result["pred_cond"].float() - mean_pred, target - mean_pred
                 )
+                total_loss = total_loss + (mse_loss + cond_mse_loss) / 2
             else:
                 cond_target = target.detach() if detach_cond_target else target
                 cond_mse_loss = F.mse_loss(result["pred_cond"].float(), cond_target)
-            total_loss = total_loss + cond_mse_loss
+                total_loss = total_loss + cond_mse_loss
             loss_dict["cond_mse"] = cond_mse_loss
+        elif result["pred"] is not None:
+            total_loss = total_loss + mse_loss
 
         action_metrics = compute_action_loss(result, actions)
         if action_metrics:
@@ -418,6 +423,7 @@ def val_epoch(model, loader, loss_fn, step, max_steps=500):
     mean_metrics = finalize_metric_store(mean_metrics)
     log_progress(None, step, {}, mean_metrics, stage="val")
     model.train()
+    return mean_metrics
 
 
 def train(
@@ -480,8 +486,9 @@ def train(
     if rank == 0 and wandb.run:
         save_checkpoint(config, model, wandb.run.id, step)  # type: ignore
 
-    val_epoch(model, val_loader, loss_fn, step)  # type: ignore
+    final_metrics = val_epoch(model, val_loader, loss_fn, step, max_steps=2000)  # type: ignore
     pbar.close()
+    return final_metrics
 
 
 def main():
@@ -532,7 +539,8 @@ def main():
         }
         wandb.init(**wandb_init_args)
 
-    train(
+    t0 = time.time()
+    final_metrics = train(
         model,
         train_loader,
         val_loader,
@@ -542,6 +550,26 @@ def main():
         config,
         rank=global_rank,
     )
+    train_time = time.time() - t0
+
+    if global_rank == 0 and final_metrics is not None:
+        cfg_path = os.path.abspath(args.config)
+        sweep_dir = os.path.dirname(os.path.dirname(cfg_path))
+        results_dir = os.path.join(sweep_dir, "results")
+        os.makedirs(results_dir, exist_ok=True)
+        run_id = os.path.splitext(os.path.basename(cfg_path))[0]
+        git_hash = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True
+        ).stdout.strip()
+        metrics = {k: float(v) for k, v in final_metrics.items() if isinstance(v, (int, float, torch.Tensor))}
+        result = {
+            "config": config,
+            "metrics": metrics,
+            "train_time_seconds": train_time,
+            "git_hash": git_hash,
+        }
+        with open(os.path.join(results_dir, f"{run_id}.json"), "w") as f:
+            json.dump(result, f, indent=2)
 
     torch.cuda.empty_cache()
     dist.destroy_process_group()
