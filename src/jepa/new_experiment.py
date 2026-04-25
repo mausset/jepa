@@ -109,9 +109,7 @@ def main(argv=None):
             f"(`git branch -D {branch}`)."
         )
 
-    # Ensure the dev worktree's parent dir exists. The artifact root
-    # (research_results/) is guaranteed to exist because the study README is
-    # in research_results/<study>/, which we just verified.
+    # Ensure the dev worktree's parent dir exists.
     dev_worktree.parent.mkdir(parents=True, exist_ok=True)
 
     subprocess.run(
@@ -120,11 +118,9 @@ def main(argv=None):
         check=True,
     )
 
-    # Absolute symlinks: data/ and research_results/ resolve identically from
-    # any cwd, so SLURM workers find datasets and write artifacts to the same
-    # shared tree whether they were launched from main or the dev worktree.
-    (dev_worktree / "data").symlink_to(workdir / "data")
-    (dev_worktree / RESEARCH_RESULTS_DIRNAME).symlink_to(workdir / RESEARCH_RESULTS_DIRNAME)
+    # No symlinks: the launcher resolves its workdir to the main repo root
+    # regardless of where it was invoked from, so SLURM workers' cwd is the
+    # main repo and `data/` / `research_results/` resolve there directly.
 
     print()
     print(f"Created {dev_worktree}")

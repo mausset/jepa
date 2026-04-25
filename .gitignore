@@ -1,10 +1,10 @@
 data/
+research_results/
 wandb/
 checkpoints/
 plots/
 slurm_out/
 temp_configs/
-experiments/
 CLAUDE.md
 figures/
 .claude/

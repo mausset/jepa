@@ -11,6 +11,7 @@ import submitit
 from omegaconf import OmegaConf
 
 from jepa.launch import (
+    find_main_repo,
     git_info,
     prepend_pythonpath,
     research_results_dir,
@@ -302,7 +303,11 @@ def main(argv=None):
     p.add_argument("--alpha", type=float, default=0.1)
 
     args = p.parse_args(argv)
-    workdir = args.workdir.resolve()
+    cwd = Path.cwd().resolve()
+    if args.workdir == Path("."):
+        workdir = find_main_repo(cwd)
+    else:
+        workdir = args.workdir.resolve()
 
     validate_name("study", args.study)
     validate_name("experiment", args.experiment)
@@ -371,7 +376,8 @@ def main(argv=None):
         "study": args.study,
         "experiment": args.experiment,
         "argv": sys.argv,
-        "cwd": str(workdir),
+        "cwd": str(cwd),
+        "workdir": str(workdir),
         "hostname": socket.gethostname(),
         "cluster_name": args.cluster,
         "cluster": cluster,
@@ -381,7 +387,7 @@ def main(argv=None):
         "n_runs": len(jobs),
         "run_ids": [j.run_id for j in jobs],
         "wandb_run_ids": [j.wandb_run_id for j in jobs],
-        "git": git_info(workdir),
+        "git": git_info(cwd),
         "worktree": str(worktree),
         "slurm_job_ids": (
             {j.run_id: jid for j, jid in zip(jobs, slurm_job_ids)}

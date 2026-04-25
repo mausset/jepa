@@ -28,6 +28,25 @@ def research_results_dir(workdir: Path) -> Path:
     return workdir / RESEARCH_RESULTS_DIRNAME
 
 
+def find_main_repo(cwd: Path) -> Path:
+    """Resolve the main worktree's root from any cwd inside the repo.
+
+    Used so the launcher's artifact paths (research_results/, data/) and the
+    SLURM workers' cwd are always the main repo, even when the user invoked
+    `jepa.launch` from inside a dev worktree under research/<study>/<exp>/.
+    git -C <cwd> rev-parse --git-common-dir resolves to the shared .git/
+    directory; its parent is the main worktree's root.
+    """
+    try:
+        common_dir = subprocess.check_output(
+            ["git", "-C", str(cwd), "rev-parse", "--git-common-dir"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except subprocess.CalledProcessError:
+        sys.exit(f"Not inside a git repository: {cwd}")
+    return (Path(cwd) / common_dir).resolve().parent
+
+
 def validate_name(kind: str, value: str) -> None:
     if not NAME_RE.match(value):
         sys.exit(
@@ -476,7 +495,16 @@ def main(argv=None):
     p.add_argument("overrides", nargs="*", help="Hydra config overrides")
 
     args = p.parse_args(argv)
-    workdir = args.workdir.resolve()
+    cwd = Path.cwd().resolve()
+    # workdir is the main repo's root — used for artifact paths and SLURM
+    # workers' cwd. Auto-resolved from cwd when --workdir is the default,
+    # so the launcher can be invoked from inside a dev worktree under
+    # research/<study>/<experiment>/ and still write artifacts to the main
+    # repo's research_results/ tree.
+    if args.workdir == Path("."):
+        workdir = find_main_repo(cwd)
+    else:
+        workdir = args.workdir.resolve()
     config_dir = str((workdir / "configs").resolve())
 
     if not args.smoke and args.study is None:
@@ -528,12 +556,12 @@ def main(argv=None):
         require_study_readme(workdir, study)
         tag = experiment_tag(study, args.experiment)
         worktree_path = experiment_dir / "code"
-        if is_dirty(workdir):
+        if is_dirty(cwd):
             sys.exit(
                 "Refusing to launch: working tree is dirty. Commit (or stash) first, "
                 "or use --smoke for dirty iteration."
             )
-        if tag_exists(workdir, tag):
+        if tag_exists(cwd, tag):
             sys.exit(
                 f"Refusing to launch: git tag `{tag}` already exists. "
                 f"Pick a different experiment name, or to redo this experiment run:\n"
@@ -581,7 +609,8 @@ def main(argv=None):
         "experiment": args.experiment,
         "argv": sys.argv,
         "cli_overrides": list(args.overrides),
-        "cwd": str(workdir),
+        "cwd": str(cwd),
+        "workdir": str(workdir),
         "hostname": socket.gethostname(),
         "slurm": use_slurm,
         "cluster": OmegaConf.to_container(cluster, resolve=True),
@@ -589,7 +618,7 @@ def main(argv=None):
         "n_seeds": len(seeds),
         "n_runs": len(jobs_info),
         "run_ids": [rid for rid, _ in jobs_info],
-        "git": git_info(workdir),
+        "git": git_info(cwd),
         "worktree": str(worktree_path) if worktree_path else None,
     }
     if tag is not None:
@@ -600,8 +629,8 @@ def main(argv=None):
     submitted = False
     try:
         if not args.smoke:
-            create_tag(workdir, tag, tag_message(study, args.experiment, launch_record))
-            create_worktree(workdir, worktree_path, tag)
+            create_tag(cwd, tag, tag_message(study, args.experiment, launch_record))
+            create_worktree(cwd, worktree_path, tag)
 
         wandb_group = (
             f"{study}/{args.experiment}" if study is not None else args.experiment
@@ -631,9 +660,9 @@ def main(argv=None):
     except BaseException:
         if not submitted and not args.smoke:
             if worktree_path is not None and worktree_path.exists():
-                remove_worktree(workdir, worktree_path)
-            if tag is not None and tag_exists(workdir, tag):
-                delete_tag(workdir, tag)
+                remove_worktree(cwd, worktree_path)
+            if tag is not None and tag_exists(cwd, tag):
+                delete_tag(cwd, tag)
         raise
 
 
@@ -711,3 +740,7 @@ def _run_local(
         if proc.returncode != 0:
             print(f"Run {run_id} failed with exit code {proc.returncode}")
             sys.exit(proc.returncode)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
