@@ -356,7 +356,8 @@ def save_checkpoint(config, model, run_id, step):
         exp_id = os.getenv("WANDB_RUN_GROUP", "default")
         run_id = str(run_id)
 
-    ckpt_dir = os.path.join("experiments", exp_id, "checkpoints", run_id)
+    workdir = os.environ.get("JEPA_WORKDIR", os.getcwd())
+    ckpt_dir = os.path.join(workdir, "research_results", exp_id, "checkpoints", run_id)
     os.makedirs(ckpt_dir, exist_ok=True)
 
     step_name = f"step_{step:08d}.pth"

@@ -10,7 +10,12 @@ from pathlib import Path
 import submitit
 from omegaconf import OmegaConf
 
-from jepa.launch import git_info, prepend_pythonpath
+from jepa.launch import (
+    git_info,
+    prepend_pythonpath,
+    research_results_dir,
+    validate_name,
+)
 
 
 # ---------- eval registry ----------
@@ -64,7 +69,7 @@ class EvalJob:
         run_id: str,
         wandb_run_id: str,
         checkpoint: Path,
-        sweep_eval_dir: Path,
+        experiment_eval_dir: Path,
         eval_names: list[str],
         env_name: str,
         planner_kwargs: dict,
@@ -76,7 +81,7 @@ class EvalJob:
         self.run_id = run_id
         self.wandb_run_id = wandb_run_id
         self.ckpt_path = Path(checkpoint)
-        self.sweep_eval_dir = Path(sweep_eval_dir)
+        self.experiment_eval_dir = Path(experiment_eval_dir)
         self.eval_names = list(eval_names)
         self.env_name = env_name
         self.planner_kwargs = dict(planner_kwargs)
@@ -92,9 +97,10 @@ class EvalJob:
     def __call__(self) -> None:
         env = os.environ.copy()
         env.setdefault("OMP_NUM_THREADS", "16")
+        env.setdefault("JEPA_WORKDIR", str(self.workdir))
         prepend_pythonpath(env, self.worktree)
 
-        out_dir = self.sweep_eval_dir / self.wandb_run_id
+        out_dir = self.experiment_eval_dir / self.wandb_run_id
         out_dir.mkdir(parents=True, exist_ok=True)
 
         for eval_name in self.eval_names:
@@ -125,7 +131,7 @@ class EvalJob:
                 run_id=self.run_id,
                 wandb_run_id=self.wandb_run_id,
                 checkpoint=self.ckpt_path,
-                sweep_eval_dir=self.sweep_eval_dir,
+                experiment_eval_dir=self.experiment_eval_dir,
                 eval_names=self.eval_names,
                 env_name=self.env_name,
                 planner_kwargs=self.planner_kwargs,
@@ -139,7 +145,7 @@ class EvalJob:
 # ---------- discovery ----------
 
 
-def discover_runs(sweep_dir: Path, runs_filter: str | None, include_crashed: bool) -> list[dict]:
+def discover_runs(experiment_dir: Path, runs_filter: str | None, include_crashed: bool) -> list[dict]:
     """Return run records (run_id, wandb_run_id, status, checkpoint) for the
     runs we'll evaluate.
 
@@ -148,7 +154,7 @@ def discover_runs(sweep_dir: Path, runs_filter: str | None, include_crashed: boo
     Skips runs with missing checkpoints.
     """
     statuses = []
-    for status_file in sorted((sweep_dir / "status").glob("*.json")):
+    for status_file in sorted((experiment_dir / "status").glob("*.json")):
         with open(status_file) as f:
             statuses.append(json.load(f))
 
@@ -165,7 +171,7 @@ def discover_runs(sweep_dir: Path, runs_filter: str | None, include_crashed: boo
         if wandb_id is None:
             print(f"Warning: status for {s['run_id']} has no wandb_run_id; skipping")
             continue
-        ckpt = sweep_dir / "checkpoints" / wandb_id / "checkpoint.pth"
+        ckpt = experiment_dir / "checkpoints" / wandb_id / "checkpoint.pth"
         if not ckpt.exists():
             print(f"Warning: no checkpoint at {ckpt}; skipping run {s['run_id']}")
             continue
@@ -178,8 +184,8 @@ def discover_runs(sweep_dir: Path, runs_filter: str | None, include_crashed: boo
     return out
 
 
-def all_outputs_exist(sweep_eval_dir: Path, wandb_run_id: str, eval_names: list[str]) -> bool:
-    out_dir = sweep_eval_dir / wandb_run_id
+def all_outputs_exist(experiment_eval_dir: Path, wandb_run_id: str, eval_names: list[str]) -> bool:
+    out_dir = experiment_eval_dir / wandb_run_id
     return all((out_dir / EVALS[name]["output_basename"]).exists() for name in eval_names)
 
 
@@ -187,14 +193,14 @@ def all_outputs_exist(sweep_eval_dir: Path, wandb_run_id: str, eval_names: list[
 
 
 def submit_slurm_eval(
-    args, workdir: Path, cluster: dict, jobs: list[EvalJob], sweep_eval_dir: Path
+    args, workdir: Path, cluster: dict, jobs: list[EvalJob], experiment_eval_dir: Path
 ) -> list[str]:
-    logs_root = sweep_eval_dir / "slurm_logs"
+    logs_root = experiment_eval_dir / "slurm_logs"
     logs_root.mkdir(parents=True, exist_ok=True)
     executor = submitit.AutoExecutor(folder=str(logs_root))
 
     slurm_params = dict(
-        name=f"eval-{args.study}-{args.sweep}",
+        name=f"eval-{args.study}-{args.experiment}",
         nodes=int(cluster.get("nodes", 1)),
         gpus_per_node=int(cluster.get("gpus_per_node", 1)),
         tasks_per_node=1,
@@ -229,14 +235,14 @@ def load_cluster(workdir: Path, name: str) -> dict:
     return OmegaConf.to_container(OmegaConf.load(cluster_yaml), resolve=True)
 
 
-def read_sweep_launch_record(sweep_dir: Path) -> dict:
-    launches = sweep_dir / "launches.jsonl"
+def read_experiment_launch_record(experiment_dir: Path) -> dict:
+    launches = experiment_dir / "launches.jsonl"
     if not launches.exists():
-        sys.exit(f"No launches.jsonl at {sweep_dir}; is this a real sweep dir?")
+        sys.exit(f"No launches.jsonl at {experiment_dir}; is this a real experiment dir?")
     with open(launches) as f:
         first_line = f.readline().strip()
     if not first_line:
-        sys.exit(f"Empty launches.jsonl at {sweep_dir}")
+        sys.exit(f"Empty launches.jsonl at {experiment_dir}")
     return json.loads(first_line)
 
 
@@ -257,18 +263,18 @@ def build_planner_kwargs(args) -> dict:
     }
 
 
-def write_launch_record(sweep_eval_dir: Path, record: dict) -> None:
-    sweep_eval_dir.mkdir(parents=True, exist_ok=True)
-    with open(sweep_eval_dir / "launches.jsonl", "a") as f:
+def write_launch_record(experiment_eval_dir: Path, record: dict) -> None:
+    experiment_eval_dir.mkdir(parents=True, exist_ok=True)
+    with open(experiment_eval_dir / "launches.jsonl", "a") as f:
         f.write(json.dumps(record, default=str) + "\n")
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(
-        description="Evaluate trained checkpoints in a sweep against one or more evals."
+        description="Evaluate trained checkpoints in an experiment against one or more evals."
     )
     p.add_argument("--study", required=True)
-    p.add_argument("--sweep", required=True)
+    p.add_argument("--experiment", required=True)
     p.add_argument("--env-name", required=True,
                    help="Env name used by `eval/planning.py` (e.g. pointmaze, keydoor).")
     p.add_argument("--evals", default="planning_mppi",
@@ -298,14 +304,17 @@ def main(argv=None):
     args = p.parse_args(argv)
     workdir = args.workdir.resolve()
 
-    sweep_dir = workdir / "experiments" / args.study / args.sweep
-    sweep_launch = read_sweep_launch_record(sweep_dir)
+    validate_name("study", args.study)
+    validate_name("experiment", args.experiment)
 
-    worktree = Path(sweep_launch["worktree"]) if sweep_launch.get("worktree") else None
+    experiment_dir = research_results_dir(workdir) / args.study / args.experiment
+    experiment_launch = read_experiment_launch_record(experiment_dir)
+
+    worktree = Path(experiment_launch["worktree"]) if experiment_launch.get("worktree") else None
     if worktree is None or not worktree.exists():
         sys.exit(
-            f"Sweep worktree {worktree} missing — refuse to eval against drifted code. "
-            f"Recreate via: git worktree add {worktree} {sweep_launch['git']['tag']}"
+            f"Experiment worktree {worktree} missing — refuse to eval against drifted code. "
+            f"Recreate via: git worktree add {worktree} {experiment_launch['git']['tag']}"
         )
 
     eval_names = [name.strip() for name in args.evals.split(",") if name.strip()]
@@ -316,13 +325,13 @@ def main(argv=None):
     cluster = load_cluster(workdir, args.cluster)
     use_slurm = bool(cluster.get("slurm", False))
 
-    runs = discover_runs(sweep_dir, args.runs, args.include_crashed)
+    runs = discover_runs(experiment_dir, args.runs, args.include_crashed)
 
-    sweep_eval_dir = sweep_dir / "eval"
+    experiment_eval_dir = experiment_dir / "eval"
     if not args.force:
         runs = [
             r for r in runs
-            if not all_outputs_exist(sweep_eval_dir, r["wandb_run_id"], eval_names)
+            if not all_outputs_exist(experiment_eval_dir, r["wandb_run_id"], eval_names)
         ]
 
     if not runs:
@@ -342,7 +351,7 @@ def main(argv=None):
             run_id=r["run_id"],
             wandb_run_id=r["wandb_run_id"],
             checkpoint=r["checkpoint"],
-            sweep_eval_dir=sweep_eval_dir,
+            experiment_eval_dir=experiment_eval_dir,
             eval_names=eval_names,
             env_name=args.env_name,
             planner_kwargs=planner_kwargs,
@@ -353,14 +362,14 @@ def main(argv=None):
 
     slurm_job_ids = None
     if use_slurm:
-        slurm_job_ids = submit_slurm_eval(args, workdir, cluster, jobs, sweep_eval_dir)
+        slurm_job_ids = submit_slurm_eval(args, workdir, cluster, jobs, experiment_eval_dir)
     else:
         run_local_eval(jobs)
 
     record = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "study": args.study,
-        "sweep": args.sweep,
+        "experiment": args.experiment,
         "argv": sys.argv,
         "cwd": str(workdir),
         "hostname": socket.gethostname(),
@@ -379,7 +388,7 @@ def main(argv=None):
             if slurm_job_ids is not None else None
         ),
     }
-    write_launch_record(sweep_eval_dir, record)
+    write_launch_record(experiment_eval_dir, record)
 
 
 if __name__ == "__main__":
