@@ -101,6 +101,19 @@ def find_free_port() -> int:
 # ---------- job ----------
 
 
+def prepend_pythonpath(env: dict[str, str], worktree: Path | None) -> None:
+    """Force `import jepa` to resolve to the worktree's snapshot.
+
+    Prepending to PYTHONPATH wins over an editable install at the repo root.
+    Leaves cwd at the repo root so data/ paths and experiments/ writes stay sane.
+    """
+    if worktree is None:
+        return
+    src = str(Path(worktree) / "src")
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{src}:{existing}" if existing else src
+
+
 class TrainJob:
     def __init__(
         self,
@@ -113,6 +126,8 @@ class TrainJob:
         nodes: int,
         setup_commands: list[str],
         retries: int,
+        worktree: Path | None = None,
+        wandb_run_group: str | None = None,
     ):
         self.workdir = workdir
         self.cfg_path = cfg_path
@@ -122,6 +137,8 @@ class TrainJob:
         self.nodes = int(nodes)
         self.setup_commands = list(setup_commands)
         self.retries = int(retries)
+        self.worktree = Path(worktree) if worktree is not None else None
+        self.wandb_run_group = wandb_run_group or sweep_name
 
     def _pre_shell(self) -> str:
         if not self.setup_commands:
@@ -149,8 +166,9 @@ class TrainJob:
 
     def __call__(self) -> None:
         env = os.environ.copy()
-        env.setdefault("WANDB_RUN_GROUP", self.sweep_name)
+        env.setdefault("WANDB_RUN_GROUP", self.wandb_run_group)
         env.setdefault("OMP_NUM_THREADS", "16")
+        prepend_pythonpath(env, self.worktree)
 
         tries = self.retries + 1
         for _ in range(tries):
@@ -172,6 +190,8 @@ class TrainJob:
                 nodes=self.nodes,
                 setup_commands=self.setup_commands,
                 retries=self.retries,
+                worktree=self.worktree,
+                wandb_run_group=self.wandb_run_group,
             )
         )
 
@@ -216,9 +236,76 @@ def git_info(workdir: Path) -> dict | None:
         return None
 
 
-def write_launch_record(record: dict, workdir: Path, sweep_name: str) -> None:
+# ---------- snapshot (tag + worktree) ----------
+
+
+def _git(workdir: Path, args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        ["git"] + args, cwd=workdir, capture_output=True, text=True
+    )
+    if check and result.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed (exit {result.returncode}): {result.stderr.strip()}"
+        )
+    return result
+
+
+def is_dirty(workdir: Path) -> bool:
+    return bool(_git(workdir, ["status", "--porcelain"]).stdout.strip())
+
+
+def tag_exists(workdir: Path, tag: str) -> bool:
+    return _git(
+        workdir, ["rev-parse", "--verify", "--quiet", f"refs/tags/{tag}"], check=False
+    ).returncode == 0
+
+
+def create_tag(workdir: Path, tag: str, message: str) -> None:
+    _git(workdir, ["tag", "-a", tag, "-m", message])
+
+
+def delete_tag(workdir: Path, tag: str) -> None:
+    _git(workdir, ["tag", "-d", tag], check=False)
+
+
+def create_worktree(workdir: Path, path: Path, ref: str) -> None:
+    _git(workdir, ["worktree", "add", str(path), ref])
+
+
+def remove_worktree(workdir: Path, path: Path) -> None:
+    _git(workdir, ["worktree", "remove", "--force", str(path)], check=False)
+
+
+def sweep_tag(study: str, sweep: str) -> str:
+    return f"sweep/{study}/{sweep}"
+
+
+def tag_message(study: str, sweep: str, launch_record: dict) -> str:
+    return (
+        f"study: {study}\n"
+        f"sweep: {sweep}\n"
+        f"date: {launch_record['timestamp']}\n"
+        f"runs: {launch_record['n_runs']} ({launch_record['n_combos']} configs × {launch_record['n_seeds']} seeds)\n"
+        f"overrides: {' '.join(launch_record['cli_overrides'])}\n"
+    )
+
+
+def sweep_dir_for(workdir: Path, study: str | None, sweep: str) -> Path:
+    """Resolve the sweep's artifact directory.
+
+    Non-smoke launches require `study` and live under `experiments/<study>/<sweep>/`.
+    Smoke launches pass `study=None` and use the flat `experiments/<sweep>/` layout.
+    """
+    if study is None:
+        return workdir / "experiments" / sweep
+    return workdir / "experiments" / study / sweep
+
+
+def write_launch_record(
+    record: dict, workdir: Path, study: str | None, sweep_name: str
+) -> None:
     central = workdir / "experiments" / "launches.jsonl"
-    per_sweep = workdir / "experiments" / sweep_name / "launches.jsonl"
+    per_sweep = sweep_dir_for(workdir, study, sweep_name) / "launches.jsonl"
     central.parent.mkdir(parents=True, exist_ok=True)
     per_sweep.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(record, default=str) + "\n"
@@ -230,17 +317,26 @@ def write_launch_record(record: dict, workdir: Path, sweep_name: str) -> None:
 # ---------- experiment notes (Obsidian-style) ----------
 
 
-_JOURNAL_HEADER = (
-    "# Experiment Journal\n\n"
-    "Reverse-chronological log of sweeps. Click a `[[sweep]]` to open its README.\n\n"
+_TOP_JOURNAL_HEADER = (
+    "# Experiment Journal — Studies\n\n"
+    "Reverse-chronological log of studies. Click a `[[study]]` to open its README.\n\n"
 )
 
 
-def _readme_template(sweep_name: str, launch_record: dict) -> str:
+def _study_journal_header(study: str) -> str:
+    return (
+        f"# Study `{study}` — Sweep Journal\n\n"
+        f"Reverse-chronological log of sweeps within this study. "
+        f"Click a `[[sweep]]` to open its README.\n\n"
+    )
+
+
+def _sweep_readme_template(study: str, sweep_name: str, launch_record: dict) -> str:
     cli = " ".join(launch_record["cli_overrides"])
     date = launch_record["timestamp"][:10]
     cluster_kind = "slurm" if launch_record["slurm"] else "local"
     return f"""---
+study: {study}
 sweep: {sweep_name}
 date: {date}
 status: running
@@ -249,6 +345,8 @@ tags: []
 
 # {sweep_name}
 
+Part of study [[{study}]].
+
 ## Hypothesis
 _What are we testing? What do we expect to learn?_
 
@@ -256,6 +354,8 @@ _What are we testing? What do we expect to learn?_
 - Launched: {launch_record["timestamp"]}
 - Cluster: {cluster_kind}
 - Runs: {launch_record["n_runs"]} ({launch_record["n_combos"]} configs × {launch_record["n_seeds"]} seeds)
+- Tag: `{launch_record["git"]["tag"]}`
+- Worktree: `{launch_record["worktree"]}`
 - Overrides: `{cli}`
 
 ## Runs
@@ -270,28 +370,86 @@ _Fill in after analyzing — what was learned, what to try next._
 """
 
 
-def scaffold_sweep_notes(workdir: Path, sweep_name: str, launch_record: dict) -> None:
-    """Create per-sweep README.md (idempotent) and prepend an entry to journal.md."""
-    sweep_dir = workdir / "experiments" / sweep_name
-    sweep_dir.mkdir(parents=True, exist_ok=True)
-    readme = sweep_dir / "README.md"
-    if not readme.exists():
-        readme.write_text(_readme_template(sweep_name, launch_record))
+def _study_readme_template(study: str, launch_record: dict) -> str:
+    date = launch_record["timestamp"][:10]
+    return f"""---
+study: {study}
+opened: {date}
+status: in-progress
+tags: []
+---
 
-    journal = workdir / "experiments" / "journal.md"
-    if not journal.exists():
-        journal.write_text(_JOURNAL_HEADER)
+# Study: {study}
+
+## Goal
+_What research question is this study answering? What does success look like
+(pass criterion, anti-overfit criterion, baseline to beat)?_
+
+## Decisions log
+_Append chronologically as evidence accumulates. Each entry: date — observation
+or decision. Keep terse._
+
+- {date} — Study opened with first sweep.
+
+## Sweep summary
+_See `journal.md` in this directory for the chronological list. Update this
+section with a curated summary table once enough sweeps have run._
+
+## Conclusion
+_Fill in once the study reaches a settled answer: final config + rationale +
+caveats. Link to the sweeps that produced the evidence._
+"""
+
+
+def scaffold_study_and_sweep(
+    workdir: Path, study: str, sweep_name: str, launch_record: dict
+) -> None:
+    """Create / update the four notebook artifacts for a non-smoke launch.
+
+    1. Per-sweep README under experiments/<study>/<sweep>/README.md (idempotent).
+    2. Per-study journal entry prepended to experiments/<study>/journal.md.
+    3. Per-study README at experiments/<study>/README.md (only on first sweep).
+    4. Top-level journal entry prepended to experiments/journal.md (only on first sweep).
+    """
+    study_dir = workdir / "experiments" / study
+    study_dir.mkdir(parents=True, exist_ok=True)
+    sweep_dir = study_dir / sweep_name
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+
+    sweep_readme = sweep_dir / "README.md"
+    if not sweep_readme.exists():
+        sweep_readme.write_text(_sweep_readme_template(study, sweep_name, launch_record))
+
+    study_readme = study_dir / "README.md"
+    is_first_sweep = not study_readme.exists()
+    if is_first_sweep:
+        study_readme.write_text(_study_readme_template(study, launch_record))
 
     cli = " ".join(launch_record["cli_overrides"])
     date = launch_record["timestamp"][:10]
-    entry = f"- {date} · [[{sweep_name}]] · {launch_record['n_runs']} runs · `{cli}`\n"
-
-    text = journal.read_text()
-    if text.startswith(_JOURNAL_HEADER):
-        new_text = _JOURNAL_HEADER + entry + text[len(_JOURNAL_HEADER):]
+    sweep_entry = f"- {date} · [[{sweep_name}]] · {launch_record['n_runs']} runs · `{cli}`\n"
+    study_journal = study_dir / "journal.md"
+    header = _study_journal_header(study)
+    if not study_journal.exists():
+        study_journal.write_text(header)
+    text = study_journal.read_text()
+    if text.startswith(header):
+        study_journal.write_text(header + sweep_entry + text[len(header):])
     else:
-        new_text = text + entry
-    journal.write_text(new_text)
+        study_journal.write_text(text + sweep_entry)
+
+    if is_first_sweep:
+        top_journal = workdir / "experiments" / "journal.md"
+        if not top_journal.exists():
+            top_journal.write_text(_TOP_JOURNAL_HEADER)
+        study_entry = f"- {date} · [[{study}]] · opened\n"
+        text = top_journal.read_text()
+        if text.startswith(_TOP_JOURNAL_HEADER):
+            top_journal.write_text(
+                _TOP_JOURNAL_HEADER + study_entry + text[len(_TOP_JOURNAL_HEADER):]
+            )
+        else:
+            top_journal.write_text(text + study_entry)
 
 
 # ---------- launcher ----------
@@ -302,6 +460,15 @@ def main(argv=None):
         description="Launch training jobs (locally or via SLURM).",
         epilog="Positional args are Hydra overrides, e.g.: +experiment=toy_craftax cluster=hopper training.lr=1e-3",
     )
+    p.add_argument(
+        "--study",
+        default=None,
+        help=(
+            "Study (research goal) this sweep belongs to. Required for non-smoke "
+            "launches. Use `tmp` for one-off iteration that doesn't belong to a "
+            "real study. Smoke launches ignore this flag."
+        ),
+    )
     p.add_argument("--sweep-name", required=True)
     p.add_argument("--seeds", type=int, default=None, help="Override sweep.seeds")
     p.add_argument("--seed-offset", type=int, default=0)
@@ -311,10 +478,10 @@ def main(argv=None):
         "--smoke",
         action="store_true",
         help=(
-            "Quick smoke test: forces cluster=local, small total_steps, "
-            "single seed, wandb disabled, capped val. Skips submitit and "
-            "skips creating notes/journal entries. Wrap in `interactive --gpus 1` "
-            "rather than running on the login node."
+            "Quick smoke test: small total_steps, single seed, wandb disabled, "
+            "capped val. Flat layout under experiments/<sweep>/, no tag, no worktree, "
+            "no scaffolding. Wrap in `interactive --gpus 1` rather than running "
+            "on the login node."
         ),
     )
     p.add_argument("overrides", nargs="*", help="Hydra config overrides")
@@ -322,6 +489,9 @@ def main(argv=None):
     args = p.parse_args(argv)
     workdir = args.workdir.resolve()
     config_dir = str((workdir / "configs").resolve())
+
+    if not args.smoke and args.study is None:
+        sys.exit("--study is required for non-smoke launches (use `--study tmp` for one-offs).")
 
     if args.smoke:
         smoke_overrides = [
@@ -354,6 +524,34 @@ def main(argv=None):
             "Pass `cluster=local` or `cluster=berzelius_interactive`."
         )
 
+    study = None if args.smoke else args.study
+    sweep_dir = sweep_dir_for(workdir, study, args.sweep_name)
+
+    # Pre-flight for non-smoke: clean tree + no collisions with prior launches.
+    tag = None
+    worktree_path: Path | None = None
+    if not args.smoke:
+        tag = sweep_tag(study, args.sweep_name)
+        worktree_path = sweep_dir / "code"
+        if is_dirty(workdir):
+            sys.exit(
+                "Refusing to launch: working tree is dirty. Commit (or stash) first, "
+                "or use --smoke for dirty iteration."
+            )
+        if tag_exists(workdir, tag):
+            sys.exit(
+                f"Refusing to launch: git tag `{tag}` already exists. "
+                f"Pick a different sweep name, or to redo this sweep run:\n"
+                f"  git tag -d {tag} && git worktree remove {worktree_path} && rm -rf {sweep_dir}"
+            )
+        if worktree_path.exists():
+            sys.exit(f"Refusing to launch: worktree path `{worktree_path}` already exists.")
+        if (sweep_dir / "launches.jsonl").exists():
+            sys.exit(
+                f"Refusing to launch: `{sweep_dir}/launches.jsonl` already exists. "
+                f"This sweep name has artifacts from a prior launch — pick a different name."
+            )
+
     # Expand sweep
     sweep_cfg = OmegaConf.select(cfg, "sweep", default=None)
     grid = expand_sweep(sweep_cfg)
@@ -369,7 +567,7 @@ def main(argv=None):
     print(f"Sweep: {len(combos)} configs x {len(seeds)} seeds = {len(run_specs)} runs")
 
     # Prepare output dirs
-    cfg_dir = workdir / "experiments" / args.sweep_name / "configs"
+    cfg_dir = sweep_dir / "configs"
     cfg_dir.mkdir(parents=True, exist_ok=True)
 
     # Build and save all run configs
@@ -384,6 +582,7 @@ def main(argv=None):
 
     launch_record = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "study": study,
         "sweep_name": args.sweep_name,
         "argv": sys.argv,
         "cli_overrides": list(args.overrides),
@@ -396,25 +595,57 @@ def main(argv=None):
         "n_runs": len(jobs_info),
         "run_ids": [rid for rid, _ in jobs_info],
         "git": git_info(workdir),
+        "worktree": str(worktree_path) if worktree_path else None,
     }
+    if tag is not None:
+        launch_record["git"] = {**(launch_record["git"] or {}), "tag": tag}
 
-    if use_slurm:
-        slurm_job_ids = _submit_slurm(args, workdir, cluster, jobs_info)
-        launch_record["slurm_job_ids"] = {
-            rid: jid for (rid, _), jid in zip(jobs_info, slurm_job_ids)
-        }
-        write_launch_record(launch_record, workdir, args.sweep_name)
+    # Snapshot creation: tag first, then worktree. Tear both down on any
+    # failure that happens before submit returns — atomic launch.
+    submitted = False
+    try:
         if not args.smoke:
-            scaffold_sweep_notes(workdir, args.sweep_name, launch_record)
-    else:
-        write_launch_record(launch_record, workdir, args.sweep_name)
-        if not args.smoke:
-            scaffold_sweep_notes(workdir, args.sweep_name, launch_record)
-        _run_local(workdir, cluster, jobs_info, args.sweep_name)
+            create_tag(workdir, tag, tag_message(study, args.sweep_name, launch_record))
+            create_worktree(workdir, worktree_path, tag)
+
+        wandb_group = (
+            f"{study}/{args.sweep_name}" if study is not None else args.sweep_name
+        )
+
+        if use_slurm:
+            slurm_job_ids = _submit_slurm(
+                args, workdir, cluster, jobs_info, sweep_dir,
+                worktree=worktree_path, wandb_run_group=wandb_group,
+            )
+            submitted = True
+            launch_record["slurm_job_ids"] = {
+                rid: jid for (rid, _), jid in zip(jobs_info, slurm_job_ids)
+            }
+            write_launch_record(launch_record, workdir, study, args.sweep_name)
+            if not args.smoke:
+                scaffold_study_and_sweep(workdir, study, args.sweep_name, launch_record)
+        else:
+            write_launch_record(launch_record, workdir, study, args.sweep_name)
+            if not args.smoke:
+                scaffold_study_and_sweep(workdir, study, args.sweep_name, launch_record)
+            submitted = True  # local run starts now; worktree must persist
+            _run_local(
+                workdir, cluster, jobs_info, args.sweep_name,
+                worktree=worktree_path, wandb_run_group=wandb_group,
+            )
+    except BaseException:
+        if not submitted and not args.smoke:
+            if worktree_path is not None and worktree_path.exists():
+                remove_worktree(workdir, worktree_path)
+            if tag is not None and tag_exists(workdir, tag):
+                delete_tag(workdir, tag)
+        raise
 
 
-def _submit_slurm(args, workdir, cluster, jobs_info):
-    logs_root = workdir / "experiments" / args.sweep_name / "slurm_logs"
+def _submit_slurm(
+    args, workdir, cluster, jobs_info, sweep_dir, worktree=None, wandb_run_group=None
+):
+    logs_root = sweep_dir / "slurm_logs"
     logs_root.mkdir(parents=True, exist_ok=True)
     executor = submitit.AutoExecutor(folder=str(logs_root))
 
@@ -433,6 +664,7 @@ def _submit_slurm(args, workdir, cluster, jobs_info):
     executor.update_parameters(**slurm_params)
 
     setup_commands = list(cluster.get("setup_commands", []))
+    group = wandb_run_group or args.sweep_name
 
     jobs = []
     with executor.batch():
@@ -446,6 +678,8 @@ def _submit_slurm(args, workdir, cluster, jobs_info):
                 nodes=int(cluster.nodes),
                 setup_commands=setup_commands,
                 retries=args.retries,
+                worktree=worktree,
+                wandb_run_group=group,
             )
             jobs.append(executor.submit(job))
 
@@ -455,15 +689,19 @@ def _submit_slurm(args, workdir, cluster, jobs_info):
     return [j.job_id for j in jobs]
 
 
-def _run_local(workdir, cluster, jobs_info, sweep_name):
+def _run_local(
+    workdir, cluster, jobs_info, sweep_name, worktree=None, wandb_run_group=None
+):
     gpus = int(cluster.get("gpus_per_node", 1))
     setup_commands = list(cluster.get("setup_commands", []) or [])
     pre_shell = " ; ".join(setup_commands) if setup_commands else ""
+    group = wandb_run_group or sweep_name
 
     for run_id, cfg_path in jobs_info:
         print(f"Running {run_id} ({cfg_path})")
         env = os.environ.copy()
-        env.setdefault("WANDB_RUN_GROUP", sweep_name)
+        env.setdefault("WANDB_RUN_GROUP", group)
+        prepend_pythonpath(env, worktree)
 
         port = find_free_port()
         torch_cmd = (
