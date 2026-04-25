@@ -663,7 +663,7 @@ def main():
         git_hash = subprocess.run(
             ["git", "rev-parse", "HEAD"], capture_output=True, text=True
         ).stdout.strip()
-        metrics = {k: float(v) for k, v in final_metrics.items() if isinstance(v, (int, float, torch.Tensor))}
+        metrics = to_scalar_dict(final_metrics)
         result = {
             "config": config,
             "metrics": metrics,
