@@ -516,7 +516,7 @@ def main(argv=None):
 
     if args.smoke:
         smoke_overrides = [
-            "training.total_steps=300",
+            "training.total_steps=30",
             "training.val_fraction=0.5",
             "training.ckpt_fraction=1.0",
             "++training.wandb=disabled",
