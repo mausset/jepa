@@ -6,13 +6,13 @@ from tqdm import tqdm
 from jepa.planning.base_planner import BasePlanner
 
 
-class CEMPlanner(BasePlanner):
-    """Cross-entropy method planner over the bottleneck's prior.
+class MPPIPlanner(BasePlanner):
+    """MPPI planner over the bottleneck's prior.
 
-    - fsq: maintains per-(step, token) categorical logits over the FSQ codebook,
-      refits to elite code counts.
-    - vae: maintains per-(step, token) Gaussian (mu, logvar) over the VAE latent,
-      refits to elite empirical mean/variance.
+    - fsq: maintains per-(step, token) categorical logits; refits with
+      softmax-weighted one-hot counts.
+    - vae: maintains per-(step, token) Gaussian (mu, logvar); refits with
+      softmax-weighted first and second moments.
     """
 
     def __init__(
@@ -22,7 +22,7 @@ class CEMPlanner(BasePlanner):
         pre_processor,
         horizon,
         population=1024,
-        elite_frac=0.1,
+        temperature=1.0,
         iterations=6,
         alpha=0.1,
         min_sigma=0.1,
@@ -31,7 +31,7 @@ class CEMPlanner(BasePlanner):
         super().__init__(wm, action_dim, pre_processor)
         self.horizon = horizon
         self.population = population
-        self.elite = max(1, int(population * elite_frac))
+        self.temperature = temperature
         self.iterations = iterations
         self.alpha = alpha
         self.min_sigma = min_sigma
@@ -40,7 +40,7 @@ class CEMPlanner(BasePlanner):
 
         if not wm.has_bottleneck:
             raise ValueError(
-                f"CEMPlanner requires a stochastic bottleneck (fsq or vae), got {wm.bottleneck_type!r}"
+                f"MPPIPlanner requires a stochastic bottleneck (fsq or vae), got {wm.bottleneck_type!r}"
             )
         self.bottleneck_predictor = wm.predictor
         self.bottleneck_type = wm.bottleneck_type
@@ -51,15 +51,6 @@ class CEMPlanner(BasePlanner):
             self.K = self.bottleneck_predictor.fsq.codebook_size
 
     def rollout_with_latents(self, z_0, latent_seq):
-        """Autoregressive rollout with caller-specified latents, windowed to
-        the predictor's training context so horizon > context stays in-distribution.
-
-        Args:
-            z_0: (M, N, D)
-            latent_seq: (M, H-1, N, latent_dim)
-        Returns:
-            (M, H, N, D) trajectory including z_0 at index 0.
-        """
         state_hist = z_0[:, None]
         for t in range(self.horizon - 1):
             latent_t = latent_seq[:, t : t + 1]
@@ -69,34 +60,25 @@ class CEMPlanner(BasePlanner):
         return state_hist
 
     def init_search_state(self, B, N, device):
-        """Initialize the per-(step, token) search distribution."""
         H = self.horizon
         if self.bottleneck_type == "fsq":
             return {"logits": torch.zeros(B, H - 1, N, self.K, device=device)}
-        # vae: N(0, I) at start, matching the prior
         return {
             "mu": torch.zeros(B, H - 1, N, self.latent_dim, device=device),
             "logvar": torch.zeros(B, H - 1, N, self.latent_dim, device=device),
         }
 
     def sample_population(self, state, P, device):
-        """Sample P populations from the search state.
-
-        Returns:
-            samples: search-space samples (B, P, H-1, N, ...) for bookkeeping/refit
-            latents: latents to condition the predictor on, (B, P, H-1, N, latent_dim)
-        """
         B = state["logits"].shape[0] if "logits" in state else state["mu"].shape[0]
         H = self.horizon
 
         if self.bottleneck_type == "fsq":
-            logits = state["logits"]
             dist = torch.distributions.Categorical(
-                logits=logits[:, None].expand(B, P, H - 1, -1, -1)
+                logits=state["logits"][:, None].expand(B, P, H - 1, -1, -1)
             )
             codes = dist.sample()  # (B, P, H-1, N)
             codebook = self.bottleneck_predictor.fsq.implicit_codebook.to(device)
-            latents = codebook[codes]  # (B, P, H-1, N, latent_dim)
+            latents = codebook[codes]
             return codes, latents
 
         mu, logvar = state["mu"], state["logvar"]
@@ -106,20 +88,27 @@ class CEMPlanner(BasePlanner):
         samples = mu_e + (0.5 * logvar_e).exp() * eps
         return samples, samples
 
-    def refit(self, state, elite_samples):
-        """Blend the search distribution toward the empirical elite distribution."""
+    def refit(self, state, samples, weights):
+        """Blend toward a softmax-weighted empirical estimate.
+
+        Args:
+            samples: search-space samples (B, P, H-1, N, ...)
+            weights: (B, P) softmax-normalized along P
+        """
         if self.bottleneck_type == "fsq":
             K = self.K
-            one_hot = F.one_hot(elite_samples, num_classes=K).float()
-            counts = one_hot.sum(dim=1)
-            new_probs = (counts + 1e-6) / (counts.sum(dim=-1, keepdim=True) + K * 1e-6)
+            one_hot = F.one_hot(samples, num_classes=K).float()  # (B, P, H-1, N, K)
+            new_probs = (weights[:, :, None, None, None] * one_hot).sum(dim=1)
+            new_probs = (new_probs + 1e-6) / (new_probs.sum(dim=-1, keepdim=True) + K * 1e-6)
             old_probs = state["logits"].softmax(dim=-1)
             blended = (1.0 - self.alpha) * old_probs + self.alpha * new_probs
             state["logits"] = blended.clamp_min(1e-12).log()
             return
 
-        new_mu = elite_samples.mean(dim=1)
-        new_var = elite_samples.var(dim=1, unbiased=False).clamp_min(self.min_sigma ** 2)
+        w = weights[:, :, None, None, None]
+        new_mu = (w * samples).sum(dim=1)
+        new_second = (w * samples.pow(2)).sum(dim=1)
+        new_var = (new_second - new_mu.pow(2)).clamp_min(self.min_sigma ** 2)
         old_var = state["logvar"].exp()
         state["mu"] = (1.0 - self.alpha) * state["mu"] + self.alpha * new_mu
         blended_var = (1.0 - self.alpha) * old_var + self.alpha * new_var
@@ -127,7 +116,6 @@ class CEMPlanner(BasePlanner):
 
     @torch.inference_mode()
     def plan(self, z_0, z_T):
-        """Plan a trajectory from z_0 to z_T by CEM over the bottleneck prior."""
         B, N, D = z_0.shape
         H = self.horizon
         P = self.population
@@ -135,7 +123,7 @@ class CEMPlanner(BasePlanner):
 
         search_state = self.init_search_state(B, N, device)
 
-        pbar = tqdm(range(self.iterations), desc="cem", leave=False) if self.progress_bar else range(self.iterations)
+        pbar = tqdm(range(self.iterations), desc="mppi", leave=False) if self.progress_bar else range(self.iterations)
         best_cost = None
         best_traj = None
 
@@ -145,26 +133,17 @@ class CEMPlanner(BasePlanner):
 
                 latents_flat = rearrange(latents, "b p h n d -> (b p) h n d")
                 z_0_flat = repeat(z_0, "b n d -> (b p) n d", p=P)
-                traj_flat = self.rollout_with_latents(z_0_flat, latents_flat)  # (B*P, H, N, D)
+                traj_flat = self.rollout_with_latents(z_0_flat, latents_flat)
 
                 z_T_rep = repeat(z_T, "b n d -> (b p) n d", p=P)
                 cost_flat = (traj_flat[:, -1] - z_T_rep).pow(2).mean(dim=(-2, -1))
                 cost = rearrange(cost_flat, "(b p) -> b p", b=B, p=P)
 
-                _, elite_idx = cost.topk(self.elite, dim=1, largest=False)
+                min_cost = cost.min(dim=1, keepdim=True).values
+                weights = torch.exp(-(cost - min_cost) / self.temperature)
+                weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
-                if self.bottleneck_type == "fsq":
-                    # samples: (B, P, H-1, N)
-                    idx_exp = elite_idx[:, :, None, None].expand(B, self.elite, H - 1, N)
-                    elite_samples = samples.gather(1, idx_exp)
-                else:
-                    # samples: (B, P, H-1, N, latent_dim)
-                    idx_exp = elite_idx[:, :, None, None, None].expand(
-                        B, self.elite, H - 1, N, self.latent_dim
-                    )
-                    elite_samples = samples.gather(1, idx_exp)
-
-                self.refit(search_state, elite_samples)
+                self.refit(search_state, samples, weights)
 
                 iter_best_idx = cost.argmin(dim=1)
                 traj = rearrange(traj_flat, "(b p) h n d -> b p h n d", b=B, p=P)

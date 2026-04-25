@@ -3,7 +3,7 @@ from torch import nn
 
 
 class SwiGLUFFN(nn.Module):
-    def __init__(self, dim, expansion=6) -> None:
+    def __init__(self, dim, expansion=6, dropout=0.0) -> None:
         super().__init__()
 
         self.dim = dim
@@ -12,7 +12,8 @@ class SwiGLUFFN(nn.Module):
         self.w1 = nn.Linear(self.dim, self.hidden_dim, bias=False)
         self.w2 = nn.Linear(self.dim, self.hidden_dim, bias=False)
         self.w3 = nn.Linear(self.hidden_dim, self.dim, bias=False)
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
         x = F.silu(self.w1(x)) * self.w2(x)
-        return self.w3(x)
+        return self.drop(self.w3(x))

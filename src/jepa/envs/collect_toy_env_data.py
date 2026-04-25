@@ -10,7 +10,7 @@ import numpy as np
 import yaml
 from tqdm import tqdm
 
-from jepa.envs.toy_envs import build_toy_env, sanitize_name
+from jepa.envs.toy_envs import build_toy_env, resize_nn, sanitize_name
 
 PARALLEL_ENVS = {"pointmaze", "push", "pusht", "keydoor", "sokoban"}
 JAX_ENVS = {"craftax"}
@@ -42,7 +42,7 @@ def collect_episode(env, max_steps: int, frame_size: tuple[int, int], rng):
     }
 
 
-def _collect_chunk(args):
+def collect_chunk(args):
     """Worker function: collect a chunk of episodes in a single env instance."""
     env_config, n_episodes, max_steps, frame_size, seed = args
     env = build_toy_env(env_config)
@@ -56,7 +56,7 @@ def _collect_chunk(args):
     return episodes
 
 
-def _collect_craftax_batch(num_episodes, max_steps, frame_size, seed, batch_size=1024):
+def collect_craftax_batch(num_episodes, max_steps, frame_size, seed, batch_size=1024):
     """Collect Craftax episodes using vectorized JAX env stepping."""
     import jax
     import jax.numpy as jnp
@@ -69,7 +69,7 @@ def _collect_craftax_batch(num_episodes, max_steps, frame_size, seed, batch_size
     v_reset = jax.vmap(env.reset, in_axes=(0, None))
     v_step = jax.vmap(env.step, in_axes=(0, 0, 0, None))
 
-    def _state_vec(state):
+    def state_vec(state):
         pos = state.player_position.astype(jnp.float32)
         stats = jnp.array([
             state.player_health, state.player_food,
@@ -78,15 +78,15 @@ def _collect_craftax_batch(num_episodes, max_steps, frame_size, seed, batch_size
         inv = jnp.array(jax.tree_util.tree_leaves(state.inventory), dtype=jnp.float32)
         return jnp.concatenate([pos, stats, inv])
 
-    v_state_vec = jax.vmap(_state_vec)
+    v_state_vec = jax.vmap(state_vec)
 
     @functools.partial(jax.jit, static_argnums=(1,))
-    def _collect_batch(key, n):
+    def collect_batch(key, n):
         key, rkey = jax.random.split(key)
         reset_keys = jax.random.split(rkey, n)
         obs, states = v_reset(reset_keys, params)
 
-        def _scan_step(carry, _):
+        def scan_step(carry, _):
             key, states, done_mask = carry
             key, skey, akey = jax.random.split(key, 3)
             actions = jax.random.randint(akey, (n,), 0, num_actions)
@@ -109,7 +109,7 @@ def _collect_craftax_batch(num_episodes, max_steps, frame_size, seed, batch_size
         init_sv = v_state_vec(states)
         init_carry = (key, states, jnp.zeros(n, dtype=bool))
         _, (all_obs, all_actions, all_svs, all_dones) = jax.lax.scan(
-            _scan_step, init_carry, None, length=max_steps - 1
+            scan_step, init_carry, None, length=max_steps - 1
         )
 
         # all_obs: (T-1, N, H, W, 3), obs: (N, H, W, 3)
@@ -138,7 +138,7 @@ def _collect_craftax_batch(num_episodes, max_steps, frame_size, seed, batch_size
     while remaining > 0:
         n = min(remaining, batch_size)
         key, subkey = jax.random.split(key)
-        frames, states_out, actions, ep_lengths = _collect_batch(subkey, n)
+        frames, states_out, actions, ep_lengths = collect_batch(subkey, n)
 
         # transfer to CPU as numpy
         frames_np = np.asarray(frames)
@@ -149,12 +149,9 @@ def _collect_craftax_batch(num_episodes, max_steps, frame_size, seed, batch_size
         for i in range(n):
             L = int(lengths_np[i])
             f = (frames_np[i, :L] * 255).astype(np.uint8)
-            # resize if needed
-            if f.shape[1:3] != frame_size:
-                h, w = frame_size
-                ys = np.linspace(0, f.shape[1] - 1, h).astype(np.int64)
-                xs = np.linspace(0, f.shape[2] - 1, w).astype(np.int64)
-                f = f[:, ys][:, :, xs]
+            _, H, W, _ = f.shape
+            if (H, W) != frame_size:
+                f = np.stack([resize_nn(frame, frame_size) for frame in f])
             all_episodes.append({
                 "frames": f,
                 "states": states_np[i, :L],
@@ -169,7 +166,7 @@ def _collect_craftax_batch(num_episodes, max_steps, frame_size, seed, batch_size
     return all_episodes, num_actions
 
 
-def _write_episodes(handle: h5py.File, episodes: list, offset: int):
+def write_episodes(handle: h5py.File, episodes: list, offset: int):
     for i, episode in enumerate(episodes):
         group = handle.create_group(f"{offset + i:06d}")
         group.attrs["episode_length"] = int(episode["episode_length"])
@@ -194,7 +191,7 @@ def collect_and_save_split(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if env_kind in JAX_ENVS:
-        episodes, num_actions = _collect_craftax_batch(
+        episodes, num_actions = collect_craftax_batch(
             num_episodes, max_steps, frame_size, seed,
         )
         state_dim = episodes[0]["states"].shape[-1]
@@ -206,8 +203,8 @@ def collect_and_save_split(
             handle.attrs["frame_height"] = frame_size[0]
             handle.attrs["frame_width"] = frame_size[1]
             handle.attrs["state_dim"] = state_dim
-            _write_episodes(handle, episodes, offset=0)
-        return None
+            write_episodes(handle, episodes, offset=0)
+        return
 
     # Probe env for metadata
     probe_env = build_toy_env(env_config)
@@ -246,8 +243,8 @@ def collect_and_save_split(
             ctx = mp.get_context("spawn")
             with ctx.Pool(num_workers) as pool:
                 with tqdm(total=num_episodes, desc=f"{env_kind}:{split} ({num_workers} workers)") as pbar:
-                    for chunk in pool.imap_unordered(_collect_chunk, worker_args):
-                        _write_episodes(handle, chunk, offset=written)
+                    for chunk in pool.imap_unordered(collect_chunk, worker_args):
+                        write_episodes(handle, chunk, offset=written)
                         written += len(chunk)
                         pbar.update(len(chunk))
         else:
@@ -256,12 +253,10 @@ def collect_and_save_split(
             try:
                 for _ in tqdm(range(num_episodes), desc=f"{env_kind}:{split}"):
                     episode = collect_episode(env, max_steps=max_steps, frame_size=frame_size, rng=rng)
-                    _write_episodes(handle, [episode], offset=written)
+                    write_episodes(handle, [episode], offset=written)
                     written += 1
             finally:
                 env.close()
-
-    return probe_env
 
 
 def main():

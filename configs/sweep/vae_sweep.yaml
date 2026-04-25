@@ -1,0 +1,7 @@
+seeds: 1
+params:
+  predictor:
+    kl_beta:
+      log2:
+        min: 0.001
+        n: 9

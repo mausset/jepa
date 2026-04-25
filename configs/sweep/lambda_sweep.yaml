@@ -1,0 +1,8 @@
+seeds: 1
+params:
+  training:
+    lambda:
+      log2:
+        min: 0.01
+        n: 6
+    # sigreg_marginal: [full]

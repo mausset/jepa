@@ -61,7 +61,7 @@ def build_encoder_config(config: dict) -> dict:
     return resolved
 
 
-class MLPProjector(nn.Module):
+class Projector(nn.Module):
     def __init__(self, dim, expansion=4, norm="bn"):
         super().__init__()
         hidden = dim * expansion
@@ -88,7 +88,7 @@ class MLPProjector(nn.Module):
 class ViTBlock(nn.Module):
     HEAD_DIM = 64
 
-    def __init__(self, dim, heads, expansion=4):
+    def __init__(self, dim, heads, expansion=4, dropout=0.0):
         super().__init__()
         self.dim = dim
         self.heads = heads
@@ -100,11 +100,12 @@ class ViTBlock(nn.Module):
         self.to_v = nn.Linear(self.dim, self.attn_dim, bias=False)
 
         self.attn_out = nn.Linear(self.attn_dim, self.dim, bias=False)
+        self.drop = nn.Dropout(dropout)
 
         self.norm_attn = nn.LayerNorm(self.dim)
         self.norm_ffn = nn.LayerNorm(self.dim)
 
-        self.ffn = SwiGLUFFN(dim, expansion=expansion)
+        self.ffn = SwiGLUFFN(dim, expansion=expansion, dropout=dropout)
 
         self.sdpa_list = [
             nn.attention.SDPBackend.FLASH_ATTENTION,
@@ -141,7 +142,7 @@ class ViTBlock(nn.Module):
             attn_output = F.scaled_dot_product_attention(q, k, v)
 
         attn_output = rearrange(attn_output, "b h n d -> b n (h d)")
-        attn_output = self.attn_out(attn_output)
+        attn_output = self.drop(self.attn_out(attn_output))
 
         x = x_pre_attn + attn_output
         x = x + self.ffn(self.norm_ffn(x))
@@ -185,11 +186,12 @@ class ViT(nn.Module):
             ),
             Rearrange("b c h w -> b (h w) c"),
         )
+        self.dropout = encoder_args.get("dropout", 0.0)
         self.blocks = nn.ModuleList(
-            [ViTBlock(self.dim, self.heads) for _ in range(self.depth)]
+            [ViTBlock(self.dim, self.heads, dropout=self.dropout) for _ in range(self.depth)]
         )
         self.projector = (
-            MLPProjector(self.dim, norm=encoder_args.get("projector_norm", "none"))
+            Projector(self.dim, norm=encoder_args.get("projector_norm", "none"))
             if encoder_args.get("projector", False)
             else nn.Identity()
         )
@@ -253,7 +255,7 @@ class ConvNeXtEncoder(nn.Module):
         self.dim = encoder_args["dim"]
         self.backbone_dim = encoder_args["backbone_dim"]
 
-        backbone = self._BACKBONES[self.arch](weights=None)
+        backbone = self._BACKBONES[self.arch](weights=None, stochastic_depth_prob=0.0)
         self.features = backbone.features
         self.pool = backbone.avgpool
 
@@ -262,7 +264,7 @@ class ConvNeXtEncoder(nn.Module):
             self.proj = nn.Linear(self.backbone_dim, self.dim)
 
         self.projector = (
-            MLPProjector(self.dim, norm=encoder_args.get("projector_norm", "none"))
+            Projector(self.dim, norm=encoder_args.get("projector_norm", "none"))
             if encoder_args.get("projector", False)
             else nn.Identity()
         )

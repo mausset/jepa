@@ -1,0 +1,7 @@
+slurm: false
+nodes: 1
+gpus_per_node: 1
+setup_commands:
+  - "module load gcc/system"
+  - "module load Mambaforge/23.3.1-1-hpc1-bdist"
+  - "mamba activate dev"

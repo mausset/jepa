@@ -6,10 +6,20 @@ envs:
   pointmaze:
     kind: pointmaze
     env_id: PointMaze_UMaze-v3
-    train_episodes: 20000
+    randomize_layout: true
+    maze_inner_shape: [4, 4]
+    space_frac: [0.5, 0.75]
+    min_start_goal_cells: 3
+    train_episodes: 10000
     val_episodes: 2000
-    max_steps: 32
-    action_repeat: 15  # 50 × 0.01s = 0.5s per step
+    max_steps: 100
+    action_repeat: 10
+    camera:
+      lookat: [0.0, 0.0, 0.0]
+      distance: 6.5
+      elevation: -90
+      azimuth: 180
+      trackbodyid: -1
 
   push:
     kind: push
@@ -22,7 +32,7 @@ envs:
   keydoor:
     kind: keydoor
     env_id: MiniGrid-DoorKey-16x16-v0
-    train_episodes: 20000
+    train_episodes: 100000
     val_episodes: 2000
     max_steps: 32
     tile_size: 8

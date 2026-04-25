@@ -5,11 +5,25 @@ import os
 
 import numpy as np
 
+from jepa.envs.maze_generator import maze_map_to_list, sample_maze_map
+
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 
 def sanitize_name(name: str) -> str:
     return name.lower().replace("-", "_").replace("/", "_")
+
+
+def resize_nn(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Nearest-neighbor resize of an (H, W, C) uint8 frame to `size=(H', W')`."""
+    frame = np.asarray(frame, dtype=np.uint8)
+    H, W, _ = frame.shape
+    if (H, W) == size:
+        return frame
+    target_h, target_w = size
+    ys = np.linspace(0, H - 1, target_h).astype(np.int64)
+    xs = np.linspace(0, W - 1, target_w).astype(np.int64)
+    return np.asarray(frame[np.ix_(ys, xs)], dtype=np.uint8)
 
 
 @dataclass
@@ -46,7 +60,6 @@ class GymToyEnv(ToyEnv):
                 "Gymnasium Robotics is required for pointmaze and push toy environments."
             ) from exc
 
-        self.frame_size = tuple(config.get("frame_size", (96, 96)))
         self.env_id = config["env_id"]
         self.action_repeat = int(config.get("action_repeat", 1))
         make_kwargs = {"render_mode": "rgb_array", "max_episode_steps": -1}
@@ -54,7 +67,7 @@ class GymToyEnv(ToyEnv):
 
         self.env = gym.make(self.env_id, **make_kwargs)
         self.last_obs = None
-        self._configure_camera(config)
+        self.configure_camera(config)
 
         if hasattr(self.env.action_space, "n"):
             action_type = "discrete"
@@ -65,7 +78,7 @@ class GymToyEnv(ToyEnv):
 
         super().__init__(action_type=action_type, action_dim=action_dim)
 
-    def _configure_camera(self, config: dict):
+    def configure_camera(self, config: dict):
         camera = config.get("camera")
         if camera is None:
             return
@@ -78,12 +91,15 @@ class GymToyEnv(ToyEnv):
         renderer.default_cam_config = camera
         renderer._viewers = {}
 
-    def _flatten_obs(self, obs):
+    def flatten_obs(self, obs):
         if isinstance(obs, dict):
             if "observation" in obs:
                 return np.asarray(obs["observation"], dtype=np.float32)
             return np.concatenate(
-                [np.asarray(value, dtype=np.float32).reshape(-1) for value in obs.values()],
+                [
+                    np.asarray(value, dtype=np.float32).reshape(-1)
+                    for value in obs.values()
+                ],
                 axis=0,
             )
         return np.asarray(obs, dtype=np.float32).reshape(-1)
@@ -110,19 +126,12 @@ class GymToyEnv(ToyEnv):
         return done
 
     def render(self, frame_size: tuple[int, int]) -> np.ndarray:
-        frame = self.env.render()
-        if frame.shape[:2] == frame_size:
-            return np.asarray(frame, dtype=np.uint8)
-
-        height, width = frame_size
-        ys = np.linspace(0, frame.shape[0] - 1, height).astype(np.int64)
-        xs = np.linspace(0, frame.shape[1] - 1, width).astype(np.int64)
-        return np.asarray(frame[np.ix_(ys, xs)], dtype=np.uint8)
+        return resize_nn(self.env.render(), frame_size)
 
     def state_vector(self) -> np.ndarray:
         if self.last_obs is None:
             raise RuntimeError("Environment must be reset before reading state.")
-        return self._flatten_obs(self.last_obs)
+        return self.flatten_obs(self.last_obs)
 
     def close(self):
         self.env.close()
@@ -149,7 +158,44 @@ class PointMazeEnv(GymToyEnv):
                 "height": merged.get("frame_size", (96, 96))[0],
             },
         )
+
+        self.randomize_layout = bool(merged.get("randomize_layout", False))
+        self.maze_inner_shape = tuple(merged.get("maze_inner_shape", [4, 4]))
+        self.space_frac = tuple(merged.get("space_frac", [0.5, 0.75]))
+        self.min_start_goal_cells = int(merged.get("min_start_goal_cells", 3))
+        self.camera_config = merged.get("camera")
+        self.base_make_kwargs = dict(merged.get("make_kwargs", {}))
+
         super().__init__(merged)
+
+    def reset(self, rng: np.random.Generator):
+        if not self.randomize_layout:
+            return super().reset(rng)
+
+        maze_map, reset_cell, goal_cell = sample_maze_map(
+            rng,
+            inner_shape=self.maze_inner_shape,
+            space_frac=self.space_frac,
+            min_start_goal_cells=self.min_start_goal_cells,
+        )
+        self.rebuild_env_with_map(maze_map)
+
+        seed = int(rng.integers(0, 2**31 - 1))
+        options = {
+            "reset_cell": np.asarray(reset_cell, dtype=np.int64),
+            "goal_cell": np.asarray(goal_cell, dtype=np.int64),
+        }
+        self.last_obs, _ = self.env.reset(seed=seed, options=options)
+
+    def rebuild_env_with_map(self, maze_map: np.ndarray):
+        import gymnasium as gym
+
+        self.env.close()
+        make_kwargs = {"render_mode": "rgb_array", "max_episode_steps": -1}
+        make_kwargs.update(self.base_make_kwargs)
+        make_kwargs["maze_map"] = maze_map_to_list(maze_map)
+        self.env = gym.make(self.env_id, **make_kwargs)
+        self.configure_camera({"camera": self.camera_config})
 
 
 class PushEnv(GymToyEnv):
@@ -174,43 +220,49 @@ class PushTEnv(ToyEnv):
             import gymnasium as gym
             import gym_pusht  # noqa: F401
         except ImportError as exc:
-            raise ImportError("gym-pusht is required for the push-t toy environment.") from exc
+            raise ImportError(
+                "gym-pusht is required for the push-t toy environment."
+            ) from exc
 
-        self.frame_size = tuple(config.get("frame_size", (96, 96)))
         self.env_id = config.get("env_id", "gym_pusht/PushT-v0")
         self.action_repeat = int(config.get("action_repeat", 1))
 
         self.env = gym.make(self.env_id, render_mode="rgb_array")
         self.last_obs = None
 
-        self._act_low = np.asarray(self.env.action_space.low, dtype=np.float32)
-        self._act_high = np.asarray(self.env.action_space.high, dtype=np.float32)
-        self._max_delta = float(config.get("max_delta", 0.15))
+        self.act_low = np.asarray(self.env.action_space.low, dtype=np.float32)
+        self.act_high = np.asarray(self.env.action_space.high, dtype=np.float32)
+        self.max_delta = float(config.get("max_delta", 0.15))
 
-        super().__init__(action_type="continuous", action_dim=int(np.prod(self.env.action_space.shape)))
+        super().__init__(
+            action_type="continuous",
+            action_dim=int(np.prod(self.env.action_space.shape)),
+        )
 
-    def _normalize_action(self, action):
+    def normalize_action(self, action):
         """Map from env range to [-1, 1]."""
-        return 2.0 * (action - self._act_low) / (self._act_high - self._act_low) - 1.0
+        return 2.0 * (action - self.act_low) / (self.act_high - self.act_low) - 1.0
 
-    def _denormalize_action(self, action):
+    def denormalize_action(self, action):
         """Map from [-1, 1] to env range."""
-        return (action + 1.0) / 2.0 * (self._act_high - self._act_low) + self._act_low
+        return (action + 1.0) / 2.0 * (self.act_high - self.act_low) + self.act_low
 
     def reset(self, rng: np.random.Generator):
         seed = int(rng.integers(0, 2**31 - 1))
         self.last_obs, _ = self.env.reset(seed=seed)
 
     def sample_action(self, rng: np.random.Generator):
-        delta = rng.uniform(-self._max_delta, self._max_delta, size=self.action_dim).astype(np.float32)
+        delta = rng.uniform(
+            -self.max_delta, self.max_delta, size=self.action_dim
+        ).astype(np.float32)
         if self.last_obs is not None:
             obs = np.asarray(self.last_obs, dtype=np.float32).reshape(-1)
-            current = self._normalize_action(obs[:self.action_dim])
+            current = self.normalize_action(obs[: self.action_dim])
             return np.clip(current + delta, -1.0, 1.0)
         return np.clip(delta, -1.0, 1.0)
 
     def step(self, action):
-        env_action = self._denormalize_action(np.asarray(action, dtype=np.float32))
+        env_action = self.denormalize_action(np.asarray(action, dtype=np.float32))
         done = False
         for _ in range(self.action_repeat):
             self.last_obs, _, terminated, truncated, _ = self.env.step(env_action)
@@ -220,22 +272,16 @@ class PushTEnv(ToyEnv):
         return done
 
     def render(self, frame_size: tuple[int, int]) -> np.ndarray:
-        frame = np.asarray(self.env.render(), dtype=np.uint8)
-        if frame.shape[:2] == frame_size:
-            return frame
-        height, width = frame_size
-        ys = np.linspace(0, frame.shape[0] - 1, height).astype(np.int64)
-        xs = np.linspace(0, frame.shape[1] - 1, width).astype(np.int64)
-        return np.asarray(frame[np.ix_(ys, xs)], dtype=np.uint8)
+        return resize_nn(self.env.render(), frame_size)
 
     def state_vector(self) -> np.ndarray:
         if self.last_obs is None:
             raise RuntimeError("Environment must be reset before reading state.")
         obs = self.last_obs
         if isinstance(obs, dict):
-            return np.concatenate([
-                np.asarray(v, dtype=np.float32).reshape(-1) for v in obs.values()
-            ])
+            return np.concatenate(
+                [np.asarray(v, dtype=np.float32).reshape(-1) for v in obs.values()]
+            )
         return np.asarray(obs, dtype=np.float32).reshape(-1)
 
     def close(self):
@@ -252,7 +298,6 @@ class KeyDoorEnv(ToyEnv):
                 "Minigrid is required for the keydoor toy environment."
             ) from exc
 
-        self.frame_size = tuple(config.get("frame_size", (96, 96)))
         self.env_id = config.get("env_id", "MiniGrid-DoorKey-16x16-v0")
         self.tile_size = int(config.get("tile_size", 8))
 
@@ -262,7 +307,9 @@ class KeyDoorEnv(ToyEnv):
         self.env = env
         self.last_obs = None
 
-        super().__init__(action_type="discrete", action_dim=int(self.env.action_space.n))
+        super().__init__(
+            action_type="discrete", action_dim=int(self.env.action_space.n)
+        )
 
     def reset(self, rng: np.random.Generator):
         seed = int(rng.integers(0, 2**31 - 1))
@@ -278,15 +325,7 @@ class KeyDoorEnv(ToyEnv):
     def render(self, frame_size: tuple[int, int]) -> np.ndarray:
         if self.last_obs is None:
             raise RuntimeError("Environment must be reset before rendering.")
-
-        frame = np.asarray(self.last_obs, dtype=np.uint8)
-        if frame.shape[:2] == frame_size:
-            return frame
-
-        height, width = frame_size
-        ys = np.linspace(0, frame.shape[0] - 1, height).astype(np.int64)
-        xs = np.linspace(0, frame.shape[1] - 1, width).astype(np.int64)
-        return np.asarray(frame[np.ix_(ys, xs)], dtype=np.uint8)
+        return resize_nn(self.last_obs, frame_size)
 
     def state_vector(self) -> np.ndarray:
         env = self.env.unwrapped
@@ -345,13 +384,14 @@ class SokobanLiteEnv(ToyEnv):
                 "gym-sokoban is required for the sokoban toy environment."
             ) from exc
 
-        self.frame_size = tuple(config.get("frame_size", (96, 96)))
         self.env_id = config.get("env_id", "Sokoban-small-v0")
         self.render_mode = config.get("render_mode", "rgb_array")
         self.env = gym.make(self.env_id, disable_env_checker=True)
         self.last_obs = None
 
-        super().__init__(action_type="discrete", action_dim=int(self.env.action_space.n))
+        super().__init__(
+            action_type="discrete", action_dim=int(self.env.action_space.n)
+        )
 
     def reset(self, rng: np.random.Generator):
         seed = int(rng.integers(0, 2**31 - 1))
@@ -377,14 +417,7 @@ class SokobanLiteEnv(ToyEnv):
         return bool(done)
 
     def render(self, frame_size: tuple[int, int]) -> np.ndarray:
-        frame = np.asarray(self.env.render(mode=self.render_mode), dtype=np.uint8)
-        if frame.shape[:2] == frame_size:
-            return frame
-
-        height, width = frame_size
-        ys = np.linspace(0, frame.shape[0] - 1, height).astype(np.int64)
-        xs = np.linspace(0, frame.shape[1] - 1, width).astype(np.int64)
-        return np.asarray(frame[np.ix_(ys, xs)], dtype=np.uint8)
+        return resize_nn(self.env.render(mode=self.render_mode), frame_size)
 
     def state_vector(self) -> np.ndarray:
         if hasattr(self.env, "player_position") and hasattr(self.env, "room_state"):
@@ -405,65 +438,64 @@ class CraftaxEnv(ToyEnv):
         try:
             import jax
             import jax.numpy as jnp
-            from craftax.craftax_classic.envs.craftax_pixels_env import CraftaxClassicPixelsEnv
+            from craftax.craftax_classic.envs.craftax_pixels_env import (
+                CraftaxClassicPixelsEnv,
+            )
         except ImportError as exc:
-            raise ImportError("Craftax and JAX are required for the craftax toy environment.") from exc
+            raise ImportError(
+                "Craftax and JAX are required for the craftax toy environment."
+            ) from exc
 
-        self._jax = jax
-        self._jnp = jnp
+        self.jax = jax
+        self.jnp = jnp
 
-        self.frame_size = tuple(config.get("frame_size", (96, 96)))
         env = CraftaxClassicPixelsEnv()
-        self._env = env
-        self._params = env.default_params
-        self._reset_fn = jax.jit(env.reset)
-        self._step_fn = jax.jit(env.step)
+        self.env = env
+        self.params = env.default_params
+        self.reset_fn = jax.jit(env.reset)
+        self.step_fn = jax.jit(env.step)
 
-        self._key = None
-        self._state = None
-        self._last_obs = None
+        self.key = None
+        self.state = None
+        self.last_obs = None
 
         super().__init__(action_type="discrete", action_dim=env.num_actions)
 
     def reset(self, rng: np.random.Generator):
         seed = int(rng.integers(0, 2**31 - 1))
-        self._key = self._jax.random.PRNGKey(seed)
-        self._key, subkey = self._jax.random.split(self._key)
-        self._last_obs, self._state = self._reset_fn(subkey, self._params)
+        self.key = self.jax.random.PRNGKey(seed)
+        self.key, subkey = self.jax.random.split(self.key)
+        self.last_obs, self.state = self.reset_fn(subkey, self.params)
 
     def sample_action(self, rng: np.random.Generator):
         return np.int64(rng.integers(self.action_dim))
 
     def step(self, action):
-        self._key, subkey = self._jax.random.split(self._key)
-        act = self._jnp.int32(int(action))
-        self._last_obs, self._state, _, done, _ = self._step_fn(
-            subkey, self._state, act, self._params
+        self.key, subkey = self.jax.random.split(self.key)
+        act = self.jnp.int32(int(action))
+        self.last_obs, self.state, _, done, _ = self.step_fn(
+            subkey, self.state, act, self.params
         )
         return bool(done)
 
     def render(self, frame_size: tuple[int, int]) -> np.ndarray:
-        if self._last_obs is None:
+        if self.last_obs is None:
             raise RuntimeError("Environment must be reset before rendering.")
-        frame = np.asarray(self._last_obs * 255, dtype=np.uint8)
-        if frame.shape[:2] == frame_size:
-            return frame
-        height, width = frame_size
-        ys = np.linspace(0, frame.shape[0] - 1, height).astype(np.int64)
-        xs = np.linspace(0, frame.shape[1] - 1, width).astype(np.int64)
-        return np.asarray(frame[np.ix_(ys, xs)], dtype=np.uint8)
+        return resize_nn(np.asarray(self.last_obs * 255, dtype=np.uint8), frame_size)
 
     def state_vector(self) -> np.ndarray:
-        if self._state is None:
+        if self.state is None:
             raise RuntimeError("Environment must be reset before reading state.")
-        s = self._state
+        s = self.state
         pos = np.asarray(s.player_position, dtype=np.float32).reshape(-1)
         stats = np.asarray(
             [s.player_health, s.player_food, s.player_drink, s.player_energy],
             dtype=np.float32,
         )
-        inv_leaves = self._jax.tree_util.tree_leaves(s.inventory)
-        inv = np.concatenate([np.asarray(l, dtype=np.float32).reshape(-1) for l in inv_leaves])
+        inv_leaves = self.jax.tree_util.tree_leaves(s.inventory)
+        inv = np.concatenate(
+            [np.asarray(l, dtype=np.float32).reshape(-1) for l in inv_leaves]
+        )
         return np.concatenate([pos, stats, inv])
 
 

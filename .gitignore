@@ -5,8 +5,10 @@ plots/
 slurm_out/
 temp_configs/
 experiments/
-claude.md
+CLAUDE.md
 figures/
+.claude/
+output.log
 
 
 # Byte-compiled / optimized / DLL files

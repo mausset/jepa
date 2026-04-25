@@ -26,7 +26,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import torch
 
-from jepa.datasets.toy_env_dataset import IMAGENET_MEAN, IMAGENET_STD, ToyEnvAugmentation
+from jepa.datasets.toy_env_dataset import IMAGENET_MEAN, IMAGENET_STD
 
 
 class CraftaxOnlineBatchIterator:
@@ -47,8 +47,6 @@ class CraftaxOnlineBatchIterator:
         batch_size: int,
         frame_size: tuple[int, int] = (96, 96),
         include_actions: bool = True,
-        photometric: str = "false",
-        crop: bool = False,
         seed: int = 0,
         buffer_size: int = 0,
     ) -> None:
@@ -59,7 +57,6 @@ class CraftaxOnlineBatchIterator:
         self.sequence_length = sequence_length
         self.batch_size = batch_size
         self.include_actions = include_actions
-        self.augmentation = ToyEnvAugmentation(photometric, crop=crop)
         self._jax = jax
 
         if buffer_size > 0 and buffer_size < batch_size:
@@ -105,9 +102,8 @@ class CraftaxOnlineBatchIterator:
             all_acts = jnp.moveaxis(all_acts, 0, 1)                  # (N, T-1)
 
             # resize on-device
-            native_h, native_w = frames.shape[2:4]
-            if native_h != target_h or native_w != target_w:
-                N_b, T_b, H, W, C = frames.shape
+            N_b, T_b, H, W, C = frames.shape
+            if H != target_h or W != target_w:
                 flat = frames.reshape(N_b * T_b, H, W, C)
                 flat = jax.image.resize(
                     flat, (N_b * T_b, target_h, target_w, C), method="bilinear"
@@ -157,12 +153,11 @@ class CraftaxOnlineBatchIterator:
             self._buf_pos = end
 
         frames = frames.float() / 255.0
-        frames = torch.stack([self.augmentation(f) for f in frames])
 
         if self._mean is None:
             dev = frames.device
-            self._mean = IMAGENET_MEAN.to(dev)
-            self._std = IMAGENET_STD.to(dev)
+            self._mean = IMAGENET_MEAN.view(1, 1, 1, 3).to(dev)
+            self._std = IMAGENET_STD.view(1, 1, 1, 3).to(dev)
         frames = (frames - self._mean) / self._std
 
         result: dict[str, torch.Tensor] = {"data": frames}
@@ -172,9 +167,6 @@ class CraftaxOnlineBatchIterator:
 
     def __len__(self) -> int:
         return 2**31
-
-    def reset(self) -> None:
-        pass  # online — data is generated continuously
 
 
 # ---------------------------------------------------------------------------
@@ -187,17 +179,13 @@ def build_craftax_online_iterators(
     batch_size = int(config["batch_size"])
     frame_size = tuple(config.get("frame_size", [96, 96]))
     include_actions = bool(config.get("include_actions", True))
-    photometric = str(config.get("photometric", "false"))
-    crop = bool(config.get("crop", False))
-    buffer_size = int(config.get("buffer_size", 0))
+    buffer_size = int(config.get("buffer_size", 8 * batch_size))
 
     train_iter = CraftaxOnlineBatchIterator(
         sequence_length=seq_len,
         batch_size=batch_size,
         frame_size=frame_size,
         include_actions=include_actions,
-        photometric=photometric,
-        crop=crop,
         seed=seed,
         buffer_size=buffer_size,
     )

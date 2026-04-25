@@ -26,9 +26,9 @@ class AttentiveProbe(nn.Module):
         self.projection = nn.Linear(dim, num_classes, bias=True)
 
     def forward(self, x):
-        b, *_ = x.shape
+        B = x.shape[0]
         x = self.ln(x)
-        cls_token = repeat(self.cls_token, "n d -> b n d", b=b)
+        cls_token = repeat(self.cls_token, "n d -> b n d", b=B)
         cls_token = self.encoder(cls_token, context=x)
         return self.projection(cls_token)
 

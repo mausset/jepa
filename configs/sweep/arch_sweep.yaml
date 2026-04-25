@@ -1,0 +1,11 @@
+seeds: 1
+params:
+  encoder:
+    arch: [vit-s, convnext-s]
+    patch_size: 12
+    n_registers: 1
+  training:
+    lambda:
+      log2:
+        min: 0.01
+        n: 6
