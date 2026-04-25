@@ -47,6 +47,24 @@ def find_main_repo(cwd: Path) -> Path:
     return (Path(cwd) / common_dir).resolve().parent
 
 
+def find_caller_repo(cwd: Path) -> Path:
+    """Resolve the caller's *own* worktree root (not the main repo's).
+
+    Used for Hydra config discovery. Configs for an experiment live on the
+    dev worktree's branch; the launcher must read them from there, not from
+    main. `git rev-parse --show-toplevel` returns the current worktree's
+    root regardless of subdirectory level.
+    """
+    try:
+        toplevel = subprocess.check_output(
+            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except subprocess.CalledProcessError:
+        sys.exit(f"Not inside a git repository: {cwd}")
+    return Path(toplevel).resolve()
+
+
 def validate_name(kind: str, value: str) -> None:
     if not NAME_RE.match(value):
         sys.exit(
@@ -505,7 +523,10 @@ def main(argv=None):
         workdir = find_main_repo(cwd)
     else:
         workdir = args.workdir.resolve()
-    config_dir = str((workdir / "configs").resolve())
+    # Configs come from the *caller's* worktree, not main — experiment-local
+    # configs (e.g. new train presets) live on the dev branch and shouldn't
+    # need to land on main to be picked up.
+    config_dir = str((find_caller_repo(cwd) / "configs").resolve())
 
     if not args.smoke and args.study is None:
         sys.exit("--study is required for non-smoke launches (use `--study tmp` for one-offs).")
