@@ -38,7 +38,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--use-latent", action="store_true", default=False)
 
-    parser.add_argument("--planner", type=str, default="collocation",
+    parser.add_argument("--planner", type=str, default="mppi",
                         choices=["collocation", "cem", "mppi", "smc", "beam"])
 
     # Collocation-specific
@@ -48,9 +48,12 @@ def parse_args():
                         choices=["adam", "sgd", "ula"])
     parser.add_argument("--project", action="store_true", default=False)
 
-    # CEM / MPPI shared
-    parser.add_argument("--population", type=int, default=1024)
-    parser.add_argument("--iterations", type=int, default=6)
+    # CEM / MPPI shared. Defaults tuned for MPPI as the canonical eval planner:
+    # smaller population/iterations than the planning literature usually uses,
+    # to keep eval cost in the few-minutes-per-checkpoint range. Revisit via a
+    # calibration sweep once we have a known-good baseline checkpoint.
+    parser.add_argument("--population", type=int, default=256)
+    parser.add_argument("--iterations", type=int, default=4)
     parser.add_argument("--alpha", type=float, default=0.1)
 
     # CEM-specific
@@ -239,7 +242,13 @@ def finalize_episode(model, ep_data, traj_opt, horizon, use_entropy, use_latent)
 def execute_plan_in_env(model, env, ep_data, traj_opt, rng, frame_size, device):
     """Replay the env to the episode's initial state and execute decoded actions.
 
-    Returns (rms distance of final encoded frame to z_T, frames of execution).
+    Returns (rms distance of final encoded frame to z_T, frames of execution,
+    success). `success` is True iff `env.step(...)` returned done=True at any
+    point during execution — i.e. the env terminated during the planned run.
+    For most toy envs (pointmaze, keydoor, sokoban, pusht, push) this is the
+    "goal reached" signal. Note that random pre-rollouts in `collect_episode`
+    discard episodes that go done, so success here means the executed plan
+    accomplished something the random policy did not.
     """
     horizon = traj_opt.shape[1] - 1
 
@@ -249,6 +258,7 @@ def execute_plan_in_env(model, env, ep_data, traj_opt, rng, frame_size, device):
     rng.bit_generator.state = saved
 
     exec_frames = [env.render(frame_size)]
+    success = False
 
     with torch.amp.autocast("cuda"):
         action_logits = model.decode_actions(traj_opt)[0]
@@ -261,6 +271,7 @@ def execute_plan_in_env(model, env, ep_data, traj_opt, rng, frame_size, device):
         done = env.step(action)
         exec_frames.append(env.render(frame_size))
         if done:
+            success = True
             break
 
     while len(exec_frames) < horizon + 1:
@@ -271,7 +282,7 @@ def execute_plan_in_env(model, env, ep_data, traj_opt, rng, frame_size, device):
         z_exec_T = model.encode(x_final)[:, 0]
         dist = (z_exec_T - ep_data["z_T"]).pow(2).mean().sqrt().item()
 
-    return dist, exec_frames
+    return dist, exec_frames, success
 
 
 def aggregate(episodes):
@@ -296,6 +307,18 @@ def aggregate(episodes):
             "mean": statistics.mean(dists),
             "median": statistics.median(dists),
             "std": statistics.pstdev(dists),
+        }
+
+    for key in ("success", "success_real"):
+        if key not in episodes[0]:
+            continue
+        flags = [bool(ep[key]) for ep in episodes]
+        n = len(flags)
+        k = sum(flags)
+        out[f"{key}_rate"] = {
+            "rate": k / n if n else 0.0,
+            "n_success": k,
+            "n_total": n,
         }
 
     return out
@@ -518,12 +541,18 @@ def plot_distributions(result, output_path, planner_name):
 
 
 def resolve_output_path(args):
+    """Resolve where to write the eval JSON.
+
+    Default convention: `<sweep>/eval/<run_id>/planning_<planner>.json`. The
+    `<run_id>` here is the wandb run id (the checkpoint dir name); each
+    checkpoint gets its own subdir so multi-eval outputs stay grouped.
+    """
     if args.output is not None:
         return Path(args.output)
     ckpt = Path(args.checkpoint).resolve()
     run_id = ckpt.parent.name
     sweep_dir = ckpt.parent.parent.parent
-    return sweep_dir / "eval" / f"{run_id}_{args.planner}_planning.json"
+    return sweep_dir / "eval" / run_id / f"planning_{args.planner}.json"
 
 
 def main():
@@ -575,16 +604,18 @@ def main():
                 ep = finalize_episode(model, ep_data, traj_opt_batch[i : i + 1],
                                       args.horizon, use_entropy, args.use_latent)
                 if model.action_decoder is not None:
-                    exec_dist, exec_frames = execute_plan_in_env(
+                    exec_dist, exec_frames, success = execute_plan_in_env(
                         model, env, ep_data, traj_opt_batch[i : i + 1],
                         rng, frame_size, device,
                     )
-                    exec_dist_real, _ = execute_plan_in_env(
+                    exec_dist_real, _, success_real = execute_plan_in_env(
                         model, env, ep_data, ep_data["traj_real"],
                         rng, frame_size, device,
                     )
                     ep["exec_dist"] = exec_dist
                     ep["exec_dist_real"] = exec_dist_real
+                    ep["success"] = success
+                    ep["success_real"] = success_real
                     if len(traj_frames) < N_TRAJ_SHOW:
                         traj_frames.append({
                             "real": ep_data["frames"],
@@ -633,11 +664,17 @@ def main():
 
     print(f"\n{args.env_name} @ step {step} ({len(episodes)} episodes, planner={args.planner})")
     m = result["metrics"]
+    if "success_rate" in m:
+        sr = m["success_rate"]
+        print(f"  success_rate    {sr['rate'] * 100:5.1f}%  ({sr['n_success']}/{sr['n_total']})")
+    if "success_real_rate" in m:
+        sr = m["success_real_rate"]
+        print(f"  success_rate_real {sr['rate'] * 100:5.1f}%  ({sr['n_success']}/{sr['n_total']})  (baseline: re-execute decoded real traj)")
     if "exec_dist" in m:
-        print(f"  exec_dist      mean={m['exec_dist']['mean']:+.4f}  "
+        print(f"  exec_dist       mean={m['exec_dist']['mean']:+.4f}  "
               f"median={m['exec_dist']['median']:+.4f}  "
               f"σ={m['exec_dist']['std']:.4f}")
-        print(f"  exec_dist_real mean={m['exec_dist_real']['mean']:+.4f}  "
+        print(f"  exec_dist_real  mean={m['exec_dist_real']['mean']:+.4f}  "
               f"median={m['exec_dist_real']['median']:+.4f}  "
               f"σ={m['exec_dist_real']['std']:.4f}  (baseline: real traj)")
     print(f"Wrote {output_path}")
