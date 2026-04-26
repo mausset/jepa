@@ -319,6 +319,44 @@ def tag_exists(workdir: Path, tag: str) -> bool:
     ).returncode == 0
 
 
+def tag_points_to_head(workdir: Path, tag: str) -> bool:
+    """True if `tag` resolves to the same commit as the current HEAD."""
+    # ^{} dereferences annotated tags to the underlying commit.
+    tag_sha = _git(workdir, ["rev-parse", f"refs/tags/{tag}^{{}}"], check=False).stdout.strip()
+    head_sha = _git(workdir, ["rev-parse", "HEAD"]).stdout.strip()
+    return bool(tag_sha) and tag_sha == head_sha
+
+
+def tag_is_ancestor_of_head(workdir: Path, tag: str) -> bool:
+    """True if the tag's commit is an ancestor of HEAD (or equal)."""
+    return _git(
+        workdir,
+        ["merge-base", "--is-ancestor", f"refs/tags/{tag}^{{}}", "HEAD"],
+        check=False,
+    ).returncode == 0
+
+
+def force_update_tag(workdir: Path, tag: str, message: str) -> None:
+    """Move an annotated tag to the current HEAD."""
+    _git(workdir, ["tag", "-f", "-a", tag, "-m", message])
+
+
+def existing_run_ids(experiment_dir: Path) -> set[str]:
+    """Collect all run_ids from prior launches in this experiment."""
+    launches = experiment_dir / "launches.jsonl"
+    if not launches.exists():
+        return set()
+    out: set[str] = set()
+    with open(launches) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            out.update(rec.get("run_ids", []))
+    return out
+
+
 def create_tag(workdir: Path, tag: str, message: str) -> None:
     _git(workdir, ["tag", "-a", tag, "-m", message])
 
@@ -570,9 +608,21 @@ def main(argv=None):
     experiment_dir = experiment_dir_for(workdir, study, args.experiment)
 
     # Pre-flight for non-smoke: study must already exist (framed via /study),
-    # working tree clean, no collisions with prior launches.
+    # working tree clean, no run_id collisions with prior launches.
+    #
+    # Re-launching into an existing experiment is supported as an *extension*:
+    # additional runs (e.g. a wider sweep grid) are submitted into the same
+    # experiment dir + same wandb group. Three cases for the tag:
+    #   - Tag at HEAD: reuse tag + snapshot as-is.
+    #   - Tag is an ancestor of HEAD: fast-forward the tag and recreate the
+    #     snapshot at HEAD. The original commit is still in git history (the
+    #     dev branch points past it), and per-launch git.hash in launches.jsonl
+    #     records what each run actually ran.
+    #   - Tag is on a divergent branch: refuse (probably wants a new experiment).
     tag = None
     worktree_path: Path | None = None
+    extending = False
+    ffwd_tag = False
     if not args.smoke:
         require_study_readme(workdir, study)
         tag = experiment_tag(study, args.experiment)
@@ -583,17 +633,25 @@ def main(argv=None):
                 "or use --smoke for dirty iteration."
             )
         if tag_exists(cwd, tag):
+            if tag_points_to_head(cwd, tag):
+                extending = True
+            elif tag_is_ancestor_of_head(cwd, tag):
+                extending = True
+                ffwd_tag = True
+            else:
+                sys.exit(
+                    f"Refusing to launch: git tag `{tag}` exists but is on a "
+                    f"divergent branch (not an ancestor of HEAD). Either rebase "
+                    f"or use a new experiment name.\n"
+                    f"  To redo this experiment from scratch:\n"
+                    f"    git tag -d {tag} && "
+                    f"git worktree remove {worktree_path} && rm -rf {experiment_dir}"
+                )
+        elif worktree_path.exists():
             sys.exit(
-                f"Refusing to launch: git tag `{tag}` already exists. "
-                f"Pick a different experiment name, or to redo this experiment run:\n"
-                f"  git tag -d {tag} && git worktree remove {worktree_path} && rm -rf {experiment_dir}"
-            )
-        if worktree_path.exists():
-            sys.exit(f"Refusing to launch: worktree path `{worktree_path}` already exists.")
-        if (experiment_dir / "launches.jsonl").exists():
-            sys.exit(
-                f"Refusing to launch: `{experiment_dir}/launches.jsonl` already exists. "
-                f"This experiment name has artifacts from a prior launch — pick a different name."
+                f"Refusing to launch: worktree path `{worktree_path}` exists but "
+                f"the experiment tag does not. Likely orphan state — clean it up:\n"
+                f"  git worktree remove {worktree_path} && rm -rf {experiment_dir}"
             )
 
     # Expand sweep
@@ -624,6 +682,20 @@ def main(argv=None):
         cfg_path = save_run_config(run_cfg, cfg_dir, run_id)
         jobs_info.append((run_id, cfg_path))
 
+    # When extending an existing experiment, refuse if any new run_id collides
+    # with a prior one (deterministic hash → same config; we'd silently
+    # overwrite status / metrics / results).
+    if not args.smoke:
+        prior_run_ids = existing_run_ids(experiment_dir)
+        new_run_ids = [rid for rid, _ in jobs_info]
+        collisions = sorted(set(new_run_ids) & prior_run_ids)
+        if collisions:
+            sys.exit(
+                f"Refusing to launch: run_id collision with prior launches in "
+                f"this experiment: {collisions}. Same (config, seed) → same hash. "
+                f"Change the sweep grid (or the seed offset) so the new runs differ."
+            )
+
     launch_record = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "study": study,
@@ -646,12 +718,28 @@ def main(argv=None):
         launch_record["git"] = {**(launch_record["git"] or {}), "tag": tag}
 
     # Snapshot creation: tag first, then worktree. Tear both down on any
-    # failure that happens before submit returns — atomic launch.
+    # failure that happens before submit returns — atomic launch. Three
+    # branches:
+    #   - Fresh launch: create tag and snapshot.
+    #   - Extending, tag already at HEAD: reuse both, no-op.
+    #   - Extending with HEAD ahead of tag: fast-forward the tag and
+    #     recreate the snapshot at HEAD.
     submitted = False
     try:
         if not args.smoke:
-            create_tag(cwd, tag, tag_message(study, args.experiment, launch_record))
-            create_worktree(cwd, worktree_path, tag)
+            if not extending:
+                create_tag(cwd, tag, tag_message(study, args.experiment, launch_record))
+                create_worktree(cwd, worktree_path, tag)
+            elif ffwd_tag:
+                print(
+                    f"Extending {tag}: fast-forwarding tag and recreating snapshot "
+                    f"(per-run git.hash in launches.jsonl preserves the original "
+                    f"runs' code identity)."
+                )
+                if worktree_path is not None and worktree_path.exists():
+                    remove_worktree(cwd, worktree_path)
+                force_update_tag(cwd, tag, tag_message(study, args.experiment, launch_record))
+                create_worktree(cwd, worktree_path, tag)
 
         wandb_group = (
             f"{study}/{args.experiment}" if study is not None else args.experiment
@@ -679,7 +767,10 @@ def main(argv=None):
                 worktree=worktree_path, wandb_run_group=wandb_group,
             )
     except BaseException:
-        if not submitted and not args.smoke:
+        # Roll back tag + worktree only if we created them this invocation.
+        # Extension launches reuse a prior tag/worktree; tearing those down
+        # would destroy the earlier launch's snapshot.
+        if not submitted and not args.smoke and not extending:
             if worktree_path is not None and worktree_path.exists():
                 remove_worktree(cwd, worktree_path)
             if tag is not None and tag_exists(cwd, tag):
