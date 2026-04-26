@@ -111,7 +111,7 @@ def fmt_axis(v: Any) -> str:
     return str(v)
 
 
-def render_experiment(experiment_dir: Path) -> None:
+def render_experiment(experiment_dir: Path, markdown: bool = False) -> None:
     runs = gather_runs(experiment_dir)
     if not runs:
         print("  (no runs)")
@@ -161,6 +161,18 @@ def render_experiment(experiment_dir: Path) -> None:
         return out
 
     str_rows = [stringify(r) for r in rows]
+
+    if markdown:
+        # Pipe is the cell separator in markdown; escape any pipes in cells
+        # (none expected in our outputs, but be safe).
+        def esc(s: str) -> str:
+            return s.replace("|", r"\|")
+        print("| " + " | ".join(esc(h) for h in headers) + " |")
+        print("|" + "|".join("---" for _ in headers) + "|")
+        for r in str_rows:
+            print("| " + " | ".join(esc(c) for c in r) + " |")
+        return
+
     widths = [
         max(len(h), max((len(r[i]) for r in str_rows), default=0))
         for i, h in enumerate(headers)
@@ -180,6 +192,8 @@ def main(argv=None):
     p.add_argument("study")
     p.add_argument("experiment", nargs="*",
                    help="Experiment names; omit to show all in the study.")
+    p.add_argument("--markdown", "--md", action="store_true",
+                   help="Render tables as markdown (renders inside chat clients).")
     args = p.parse_args(argv)
 
     cwd = Path.cwd().resolve()
@@ -202,11 +216,14 @@ def main(argv=None):
         exp_dir = study_dir / name
         if i:
             print()
-        print(f"=== {name} ===")
+        if args.markdown:
+            print(f"### {name}\n")
+        else:
+            print(f"=== {name} ===")
         if not exp_dir.exists():
             print("  (no experiment dir)")
             continue
-        render_experiment(exp_dir)
+        render_experiment(exp_dir, markdown=args.markdown)
 
 
 if __name__ == "__main__":
