@@ -2,6 +2,7 @@ import argparse
 import datetime
 import json
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -77,6 +78,7 @@ class EvalJob:
         worktree: Path | None,
         setup_commands: list[str],
         retries: int,
+        code_hash: str | None = None,
     ):
         self.workdir = Path(workdir)
         self.run_id = run_id
@@ -89,6 +91,7 @@ class EvalJob:
         self.worktree = Path(worktree) if worktree is not None else None
         self.setup_commands = list(setup_commands)
         self.retries = int(retries)
+        self.code_hash = code_hash
 
     def _pre_shell(self) -> str:
         if not self.setup_commands:
@@ -98,7 +101,9 @@ class EvalJob:
     def __call__(self) -> None:
         env = os.environ.copy()
         env.setdefault("OMP_NUM_THREADS", "16")
-        env.setdefault("JEPA_WORKDIR", str(self.workdir))
+        env.setdefault("SOURCE_WORKDIR", str(self.workdir))
+        if self.code_hash is not None:
+            env["SOURCE_GIT_HASH"] = self.code_hash
         prepend_pythonpath(env, self.worktree)
 
         out_dir = self.experiment_eval_dir / self.wandb_run_id
@@ -110,7 +115,7 @@ class EvalJob:
             argv = spec["runner"](
                 self.ckpt_path, output_path, self.env_name, self.planner_kwargs
             )
-            inner = " ".join(argv)
+            inner = shlex.join(argv)
             cmd = f"{self._pre_shell()} ; {inner}"
 
             tries = self.retries + 1
@@ -139,6 +144,7 @@ class EvalJob:
                 worktree=self.worktree,
                 setup_commands=self.setup_commands,
                 retries=self.retries,
+                code_hash=self.code_hash,
             )
         )
 
@@ -321,6 +327,8 @@ def main(argv=None):
             f"Experiment worktree {worktree} missing — refuse to eval against drifted code. "
             f"Recreate via: git worktree add {worktree} {experiment_launch['git']['tag']}"
         )
+    code_git = git_info(worktree) or {}
+    code_hash = code_git.get("hash")
 
     eval_names = [name.strip() for name in args.evals.split(",") if name.strip()]
     for name in eval_names:
@@ -363,6 +371,7 @@ def main(argv=None):
             worktree=worktree,
             setup_commands=setup_commands,
             retries=args.retries,
+            code_hash=code_hash,
         ))
 
     slurm_job_ids = None
@@ -388,6 +397,7 @@ def main(argv=None):
         "run_ids": [j.run_id for j in jobs],
         "wandb_run_ids": [j.wandb_run_id for j in jobs],
         "git": git_info(cwd),
+        "code_git": code_git,
         "worktree": str(worktree),
         "slurm_job_ids": (
             {j.run_id: jid for j, jid in zip(jobs, slurm_job_ids)}

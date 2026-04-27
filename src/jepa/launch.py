@@ -4,9 +4,11 @@ import itertools
 import json
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -186,6 +188,7 @@ class TrainJob:
         retries: int,
         worktree: Path | None = None,
         wandb_run_group: str | None = None,
+        code_hash: str | None = None,
     ):
         self.workdir = workdir
         self.cfg_path = cfg_path
@@ -197,42 +200,43 @@ class TrainJob:
         self.retries = int(retries)
         self.worktree = Path(worktree) if worktree is not None else None
         self.wandb_run_group = wandb_run_group or experiment
+        self.code_hash = code_hash
 
     def _pre_shell(self) -> str:
         if not self.setup_commands:
             return "true"
         return " ; ".join(self.setup_commands)
 
-    def _torch_cmd(self, master_port: int) -> str:
-        return " ".join(
-            [
-                "torchrun",
-                "--nnodes",
-                str(self.nodes),
-                "--nproc-per-node",
-                str(self.gpus_per_node),
-                "--rdzv-backend",
-                "c10d",
-                "--rdzv-endpoint",
-                f"localhost:{master_port}",
-                "-m",
-                "jepa.train",
-                "--config",
-                str(self.cfg_path),
-            ]
-        )
+    def torch_argv(self, master_port: int) -> list[str]:
+        return [
+            "torchrun",
+            "--nnodes",
+            str(self.nodes),
+            "--nproc-per-node",
+            str(self.gpus_per_node),
+            "--rdzv-backend",
+            "c10d",
+            "--rdzv-endpoint",
+            f"localhost:{master_port}",
+            "-m",
+            "jepa.train",
+            "--config",
+            str(self.cfg_path),
+        ]
 
     def __call__(self) -> None:
         env = os.environ.copy()
         env.setdefault("WANDB_RUN_GROUP", self.wandb_run_group)
-        env.setdefault("JEPA_WORKDIR", str(self.workdir))
+        env.setdefault("SOURCE_WORKDIR", str(self.workdir))
         env.setdefault("OMP_NUM_THREADS", "16")
+        if self.code_hash is not None:
+            env["SOURCE_GIT_HASH"] = self.code_hash
         prepend_pythonpath(env, self.worktree)
 
         tries = self.retries + 1
         for _ in range(tries):
             port = find_free_port()
-            cmd = f"{self._pre_shell()} ; {self._torch_cmd(port)}"
+            cmd = f"{self._pre_shell()} ; {shlex.join(self.torch_argv(port))}"
             proc = subprocess.run(["bash", "-lc", cmd], cwd=self.workdir, env=env)
             if proc.returncode == 0:
                 return
@@ -251,6 +255,7 @@ class TrainJob:
                 retries=self.retries,
                 worktree=self.worktree,
                 wandb_run_group=self.wandb_run_group,
+                code_hash=self.code_hash,
             )
         )
 
@@ -518,12 +523,34 @@ def require_study_readme(workdir: Path, study: str) -> None:
 # ---------- launcher ----------
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(
+@dataclass(frozen=True)
+class LaunchPaths:
+    cwd: Path
+    workdir: Path
+    config_dir: str
+
+
+@dataclass(frozen=True)
+class SnapshotMode:
+    tag: str | None = None
+    worktree_path: Path | None = None
+    extending: bool = False
+    ffwd_tag: bool = False
+
+
+@dataclass(frozen=True)
+class RunPlan:
+    combos: list[dict[str, Any]]
+    seeds: list[int]
+    jobs_info: list[tuple[str, Path]]
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
         description="Launch training jobs (locally or via SLURM).",
         epilog="Positional args are Hydra overrides, e.g.: +train=toy_craftax cluster=hopper training.lr=1e-3",
     )
-    p.add_argument(
+    parser.add_argument(
         "--study",
         default=None,
         help=(
@@ -532,13 +559,16 @@ def main(argv=None):
             "doesn't belong to a real study. Smoke launches ignore this flag."
         ),
     )
-    p.add_argument("--experiment", required=True,
-                   help="Experiment name within the study. One launch == one experiment.")
-    p.add_argument("--seeds", type=int, default=None, help="Override sweep.seeds")
-    p.add_argument("--seed-offset", type=int, default=0)
-    p.add_argument("--retries", type=int, default=0)
-    p.add_argument("--workdir", type=Path, default=Path("."))
-    p.add_argument(
+    parser.add_argument(
+        "--experiment",
+        required=True,
+        help="Experiment name within the study. One launch == one experiment.",
+    )
+    parser.add_argument("--seeds", type=int, default=None, help="Override sweep.seeds")
+    parser.add_argument("--seed-offset", type=int, default=0)
+    parser.add_argument("--retries", type=int, default=0)
+    parser.add_argument("--workdir", type=Path, default=Path("."))
+    parser.add_argument(
         "--smoke",
         action="store_true",
         help=(
@@ -548,9 +578,11 @@ def main(argv=None):
             "than running on the login node."
         ),
     )
-    p.add_argument("overrides", nargs="*", help="Hydra config overrides")
+    parser.add_argument("overrides", nargs="*", help="Hydra config overrides")
+    return parser.parse_args(argv)
 
-    args = p.parse_args(argv)
+
+def resolve_launch_paths(args: argparse.Namespace) -> LaunchPaths:
     cwd = Path.cwd().resolve()
     # workdir is the main repo's root — used for artifact paths and SLURM
     # workers' cwd. Auto-resolved from cwd when --workdir is the default,
@@ -565,7 +597,10 @@ def main(argv=None):
     # configs (e.g. new train presets) live on the dev branch and shouldn't
     # need to land on main to be picked up.
     config_dir = str((find_caller_repo(cwd) / "configs").resolve())
+    return LaunchPaths(cwd=cwd, workdir=workdir, config_dir=config_dir)
 
+
+def validate_launch_request(args: argparse.Namespace) -> None:
     if not args.smoke and args.study is None:
         sys.exit("--study is required for non-smoke launches (use `--study tmp` for one-offs).")
 
@@ -573,40 +608,50 @@ def main(argv=None):
     if args.study is not None:
         validate_name("study", args.study)
 
-    if args.smoke:
-        smoke_overrides = [
-            "training.total_steps=30",
-            "training.val_fraction=0.5",
-            "training.ckpt_fraction=1.0",
-            "++training.wandb=disabled",
-            "++training.val_max_steps=5",
-            "++training.final_val_max_steps=5",
-        ]
-        # Smoke overrides go last so they win over user CLI overrides
-        # (later overrides win in Hydra). Cluster is intentionally NOT forced —
-        # pick a non-slurm cluster appropriate for the host (e.g. `cluster=local`
-        # on a workstation, `cluster=berzelius_interactive` inside an
-        # `interactive --gpus 1` session).
-        args.overrides = list(args.overrides) + smoke_overrides
-        args.seeds = 1
-        args.retries = 0
 
-    # Compose config via Hydra
+def apply_smoke_overrides(args: argparse.Namespace) -> None:
+    if not args.smoke:
+        return
+    smoke_overrides = [
+        "training.total_steps=30",
+        "training.val_fraction=0.5",
+        "training.ckpt_fraction=1.0",
+        "++training.wandb=disabled",
+        "++training.val_max_steps=5",
+        "++training.final_val_max_steps=5",
+    ]
+    # Smoke overrides go last so they win over user CLI overrides (later
+    # overrides win in Hydra). Cluster is intentionally NOT forced — pick a
+    # non-slurm cluster appropriate for the host.
+    args.overrides = list(args.overrides) + smoke_overrides
+    args.seeds = 1
+    args.retries = 0
+
+
+def compose_launch_config(config_dir: str, overrides: list[str]) -> DictConfig:
     with initialize_config_dir(config_dir=config_dir, version_base=None):
-        cfg = compose("config", overrides=args.overrides)
+        return compose("config", overrides=overrides)
 
-    cluster = cfg.cluster
-    use_slurm = bool(cluster.get("slurm", False))
 
+def resolve_study(args: argparse.Namespace) -> str | None:
+    return None if args.smoke else args.study
+
+
+def require_sync_smoke(args: argparse.Namespace, use_slurm: bool) -> None:
     if args.smoke and use_slurm:
         sys.exit(
             "--smoke must run synchronously; got cluster.slurm=true. "
             "Pass `cluster=local` or `cluster=berzelius_interactive`."
         )
 
-    study = None if args.smoke else args.study
-    experiment_dir = experiment_dir_for(workdir, study, args.experiment)
 
+def resolve_snapshot_mode(
+    args: argparse.Namespace,
+    cwd: Path,
+    workdir: Path,
+    study: str | None,
+    experiment_dir: Path,
+) -> SnapshotMode:
     # Pre-flight for non-smoke: study must already exist (framed via /study),
     # working tree clean, no run_id collisions with prior launches.
     #
@@ -619,41 +664,45 @@ def main(argv=None):
     #     dev branch points past it), and per-launch git.hash in launches.jsonl
     #     records what each run actually ran.
     #   - Tag is on a divergent branch: refuse (probably wants a new experiment).
-    tag = None
-    worktree_path: Path | None = None
-    extending = False
-    ffwd_tag = False
-    if not args.smoke:
-        require_study_readme(workdir, study)
-        tag = experiment_tag(study, args.experiment)
-        worktree_path = experiment_dir / "code"
-        if is_dirty(cwd):
-            sys.exit(
-                "Refusing to launch: working tree is dirty. Commit (or stash) first, "
-                "or use --smoke for dirty iteration."
-            )
-        if tag_exists(cwd, tag):
-            if tag_points_to_head(cwd, tag):
-                extending = True
-            elif tag_is_ancestor_of_head(cwd, tag):
-                extending = True
-                ffwd_tag = True
-            else:
-                sys.exit(
-                    f"Refusing to launch: git tag `{tag}` exists but is on a "
-                    f"divergent branch (not an ancestor of HEAD). Either rebase "
-                    f"or use a new experiment name.\n"
-                    f"  To redo this experiment from scratch:\n"
-                    f"    git tag -d {tag} && "
-                    f"git worktree remove {worktree_path} && rm -rf {experiment_dir}"
-                )
-        elif worktree_path.exists():
-            sys.exit(
-                f"Refusing to launch: worktree path `{worktree_path}` exists but "
-                f"the experiment tag does not. Likely orphan state — clean it up:\n"
-                f"  git worktree remove {worktree_path} && rm -rf {experiment_dir}"
-            )
+    if args.smoke:
+        return SnapshotMode()
+    if study is None:
+        raise ValueError("non-smoke launches require a study")
 
+    require_study_readme(workdir, study)
+    tag = experiment_tag(study, args.experiment)
+    worktree_path = experiment_dir / "code"
+    if is_dirty(cwd):
+        sys.exit(
+            "Refusing to launch: working tree is dirty. Commit (or stash) first, "
+            "or use --smoke for dirty iteration."
+        )
+
+    if tag_exists(cwd, tag):
+        if tag_points_to_head(cwd, tag):
+            return SnapshotMode(tag=tag, worktree_path=worktree_path, extending=True)
+        if tag_is_ancestor_of_head(cwd, tag):
+            return SnapshotMode(
+                tag=tag, worktree_path=worktree_path, extending=True, ffwd_tag=True
+            )
+        sys.exit(
+            f"Refusing to launch: git tag `{tag}` exists but is on a "
+            f"divergent branch (not an ancestor of HEAD). Either rebase "
+            f"or use a new experiment name.\n"
+            f"  To redo this experiment from scratch:\n"
+            f"    git tag -d {tag} && "
+            f"git worktree remove {worktree_path} && rm -rf {experiment_dir}"
+        )
+    if worktree_path.exists():
+        sys.exit(
+            f"Refusing to launch: worktree path `{worktree_path}` exists but "
+            f"the experiment tag does not. Likely orphan state — clean it up:\n"
+            f"  git worktree remove {worktree_path} && rm -rf {experiment_dir}"
+        )
+    return SnapshotMode(tag=tag, worktree_path=worktree_path)
+
+
+def build_run_plan(args: argparse.Namespace, cfg: DictConfig, experiment_dir: Path) -> RunPlan:
     # Expand sweep
     sweep_cfg = OmegaConf.select(cfg, "sweep", default=None)
     grid = expand_sweep(sweep_cfg)
@@ -681,42 +730,67 @@ def main(argv=None):
         run_cfg = build_run_config(cfg, overrides, seed)
         cfg_path = save_run_config(run_cfg, cfg_dir, run_id)
         jobs_info.append((run_id, cfg_path))
+    return RunPlan(combos=combos, seeds=seeds, jobs_info=jobs_info)
 
+
+def require_new_run_ids(
+    args: argparse.Namespace, experiment_dir: Path, jobs_info: list[tuple[str, Path]]
+) -> None:
     # When extending an existing experiment, refuse if any new run_id collides
     # with a prior one (deterministic hash → same config; we'd silently
     # overwrite status / metrics / results).
-    if not args.smoke:
-        prior_run_ids = existing_run_ids(experiment_dir)
-        new_run_ids = [rid for rid, _ in jobs_info]
-        collisions = sorted(set(new_run_ids) & prior_run_ids)
-        if collisions:
-            sys.exit(
-                f"Refusing to launch: run_id collision with prior launches in "
-                f"this experiment: {collisions}. Same (config, seed) → same hash. "
-                f"Change the sweep grid (or the seed offset) so the new runs differ."
-            )
+    if args.smoke:
+        return
+    prior_run_ids = existing_run_ids(experiment_dir)
+    new_run_ids = [rid for rid, _ in jobs_info]
+    collisions = sorted(set(new_run_ids) & prior_run_ids)
+    if collisions:
+        sys.exit(
+            f"Refusing to launch: run_id collision with prior launches in "
+            f"this experiment: {collisions}. Same (config, seed) → same hash. "
+            f"Change the sweep grid (or the seed offset) so the new runs differ."
+        )
 
+
+def build_launch_record(
+    args: argparse.Namespace,
+    paths: LaunchPaths,
+    cluster: DictConfig,
+    use_slurm: bool,
+    study: str | None,
+    snapshot: SnapshotMode,
+    run_plan: RunPlan,
+) -> dict[str, Any]:
     launch_record = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "study": study,
         "experiment": args.experiment,
         "argv": sys.argv,
         "cli_overrides": list(args.overrides),
-        "cwd": str(cwd),
-        "workdir": str(workdir),
+        "cwd": str(paths.cwd),
+        "workdir": str(paths.workdir),
         "hostname": socket.gethostname(),
         "slurm": use_slurm,
         "cluster": OmegaConf.to_container(cluster, resolve=True),
-        "n_combos": len(combos),
-        "n_seeds": len(seeds),
-        "n_runs": len(jobs_info),
-        "run_ids": [rid for rid, _ in jobs_info],
-        "git": git_info(cwd),
-        "worktree": str(worktree_path) if worktree_path else None,
+        "n_combos": len(run_plan.combos),
+        "n_seeds": len(run_plan.seeds),
+        "n_runs": len(run_plan.jobs_info),
+        "run_ids": [rid for rid, _ in run_plan.jobs_info],
+        "git": git_info(paths.cwd),
+        "worktree": str(snapshot.worktree_path) if snapshot.worktree_path else None,
     }
-    if tag is not None:
-        launch_record["git"] = {**(launch_record["git"] or {}), "tag": tag}
+    if snapshot.tag is not None:
+        launch_record["git"] = {**(launch_record["git"] or {}), "tag": snapshot.tag}
+    return launch_record
 
+
+def prepare_snapshot(
+    cwd: Path,
+    snapshot: SnapshotMode,
+    study: str | None,
+    experiment: str,
+    launch_record: dict[str, Any],
+) -> None:
     # Snapshot creation: tag first, then worktree. Tear both down on any
     # failure that happens before submit returns — atomic launch. Three
     # branches:
@@ -724,62 +798,115 @@ def main(argv=None):
     #   - Extending, tag already at HEAD: reuse both, no-op.
     #   - Extending with HEAD ahead of tag: fast-forward the tag and
     #     recreate the snapshot at HEAD.
+    if snapshot.tag is None:
+        return
+    if study is None or snapshot.worktree_path is None:
+        raise ValueError("snapshot launches require a study and worktree path")
+
+    if not snapshot.extending:
+        create_tag(cwd, snapshot.tag, tag_message(study, experiment, launch_record))
+        create_worktree(cwd, snapshot.worktree_path, snapshot.tag)
+    elif snapshot.ffwd_tag:
+        print(
+            f"Extending {snapshot.tag}: fast-forwarding tag and recreating snapshot "
+            f"(per-run git.hash in launches.jsonl preserves the original "
+            f"runs' code identity)."
+        )
+        if snapshot.worktree_path.exists():
+            remove_worktree(cwd, snapshot.worktree_path)
+        force_update_tag(cwd, snapshot.tag, tag_message(study, experiment, launch_record))
+        create_worktree(cwd, snapshot.worktree_path, snapshot.tag)
+
+
+def rollback_fresh_snapshot(cwd: Path, snapshot: SnapshotMode) -> None:
+    if snapshot.worktree_path is not None and snapshot.worktree_path.exists():
+        remove_worktree(cwd, snapshot.worktree_path)
+    if snapshot.tag is not None and tag_exists(cwd, snapshot.tag):
+        delete_tag(cwd, snapshot.tag)
+
+
+def wandb_group_for(study: str | None, experiment: str) -> str:
+    return f"{study}/{experiment}" if study is not None else experiment
+
+
+def persist_launch_record(
+    launch_record: dict[str, Any],
+    workdir: Path,
+    study: str | None,
+    experiment: str,
+    smoke: bool,
+) -> None:
+    write_launch_record(launch_record, workdir, study, experiment)
+    if not smoke:
+        if study is None:
+            raise ValueError("non-smoke launches require a study")
+        scaffold_experiment(workdir, study, experiment, launch_record)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    paths = resolve_launch_paths(args)
+    validate_launch_request(args)
+    apply_smoke_overrides(args)
+
+    cfg = compose_launch_config(paths.config_dir, args.overrides)
+    cluster = cfg.cluster
+    use_slurm = bool(cluster.get("slurm", False))
+    require_sync_smoke(args, use_slurm)
+
+    study = resolve_study(args)
+    experiment_dir = experiment_dir_for(paths.workdir, study, args.experiment)
+    snapshot = resolve_snapshot_mode(
+        args, paths.cwd, paths.workdir, study, experiment_dir
+    )
+    run_plan = build_run_plan(args, cfg, experiment_dir)
+    require_new_run_ids(args, experiment_dir, run_plan.jobs_info)
+
+    launch_record = build_launch_record(
+        args, paths, cluster, use_slurm, study, snapshot, run_plan
+    )
+
     submitted = False
     try:
-        if not args.smoke:
-            if not extending:
-                create_tag(cwd, tag, tag_message(study, args.experiment, launch_record))
-                create_worktree(cwd, worktree_path, tag)
-            elif ffwd_tag:
-                print(
-                    f"Extending {tag}: fast-forwarding tag and recreating snapshot "
-                    f"(per-run git.hash in launches.jsonl preserves the original "
-                    f"runs' code identity)."
-                )
-                if worktree_path is not None and worktree_path.exists():
-                    remove_worktree(cwd, worktree_path)
-                force_update_tag(cwd, tag, tag_message(study, args.experiment, launch_record))
-                create_worktree(cwd, worktree_path, tag)
-
-        wandb_group = (
-            f"{study}/{args.experiment}" if study is not None else args.experiment
-        )
+        prepare_snapshot(paths.cwd, snapshot, study, args.experiment, launch_record)
+        wandb_group = wandb_group_for(study, args.experiment)
+        code_hash = (launch_record["git"] or {}).get("hash")
 
         if use_slurm:
             slurm_job_ids = _submit_slurm(
-                args, workdir, cluster, jobs_info, experiment_dir,
-                worktree=worktree_path, wandb_run_group=wandb_group,
+                args, paths.workdir, cluster, run_plan.jobs_info, experiment_dir,
+                worktree=snapshot.worktree_path, wandb_run_group=wandb_group,
+                code_hash=code_hash,
             )
             submitted = True
             launch_record["slurm_job_ids"] = {
-                rid: jid for (rid, _), jid in zip(jobs_info, slurm_job_ids)
+                rid: jid for (rid, _), jid in zip(run_plan.jobs_info, slurm_job_ids)
             }
-            write_launch_record(launch_record, workdir, study, args.experiment)
-            if not args.smoke:
-                scaffold_experiment(workdir, study, args.experiment, launch_record)
+            persist_launch_record(
+                launch_record, paths.workdir, study, args.experiment, args.smoke
+            )
         else:
-            write_launch_record(launch_record, workdir, study, args.experiment)
-            if not args.smoke:
-                scaffold_experiment(workdir, study, args.experiment, launch_record)
+            persist_launch_record(
+                launch_record, paths.workdir, study, args.experiment, args.smoke
+            )
             submitted = True  # local run starts now; worktree must persist
             _run_local(
-                workdir, cluster, jobs_info, args.experiment,
-                worktree=worktree_path, wandb_run_group=wandb_group,
+                paths.workdir, cluster, run_plan.jobs_info, args.experiment,
+                worktree=snapshot.worktree_path, wandb_run_group=wandb_group,
+                code_hash=code_hash,
             )
     except BaseException:
         # Roll back tag + worktree only if we created them this invocation.
         # Extension launches reuse a prior tag/worktree; tearing those down
         # would destroy the earlier launch's snapshot.
-        if not submitted and not args.smoke and not extending:
-            if worktree_path is not None and worktree_path.exists():
-                remove_worktree(cwd, worktree_path)
-            if tag is not None and tag_exists(cwd, tag):
-                delete_tag(cwd, tag)
+        if not submitted and not args.smoke and not snapshot.extending:
+            rollback_fresh_snapshot(paths.cwd, snapshot)
         raise
 
 
 def _submit_slurm(
-    args, workdir, cluster, jobs_info, experiment_dir, worktree=None, wandb_run_group=None
+    args, workdir, cluster, jobs_info, experiment_dir,
+    worktree=None, wandb_run_group=None, code_hash=None,
 ):
     logs_root = experiment_dir / "slurm_logs"
     logs_root.mkdir(parents=True, exist_ok=True)
@@ -816,6 +943,7 @@ def _submit_slurm(
                 retries=args.retries,
                 worktree=worktree,
                 wandb_run_group=group,
+                code_hash=code_hash,
             )
             jobs.append(executor.submit(job))
 
@@ -826,7 +954,8 @@ def _submit_slurm(
 
 
 def _run_local(
-    workdir, cluster, jobs_info, experiment, worktree=None, wandb_run_group=None
+    workdir, cluster, jobs_info, experiment, worktree=None, wandb_run_group=None,
+    code_hash=None,
 ):
     gpus = int(cluster.get("gpus_per_node", 1))
     setup_commands = list(cluster.get("setup_commands", []) or [])
@@ -837,15 +966,26 @@ def _run_local(
         print(f"Running {run_id} ({cfg_path})")
         env = os.environ.copy()
         env.setdefault("WANDB_RUN_GROUP", group)
-        env.setdefault("JEPA_WORKDIR", str(workdir))
+        env.setdefault("SOURCE_WORKDIR", str(workdir))
+        if code_hash is not None:
+            env["SOURCE_GIT_HASH"] = code_hash
         prepend_pythonpath(env, worktree)
 
         port = find_free_port()
-        torch_cmd = (
-            f"torchrun --nproc-per-node {gpus} "
-            f"--rdzv-backend c10d --rdzv-endpoint localhost:{port} "
-            f"-m jepa.train --config {cfg_path}"
-        )
+        torch_argv = [
+            "torchrun",
+            "--nproc-per-node",
+            str(gpus),
+            "--rdzv-backend",
+            "c10d",
+            "--rdzv-endpoint",
+            f"localhost:{port}",
+            "-m",
+            "jepa.train",
+            "--config",
+            str(cfg_path),
+        ]
+        torch_cmd = shlex.join(torch_argv)
         cmd = f"{pre_shell} ; {torch_cmd}" if pre_shell else torch_cmd
 
         proc = subprocess.run(["bash", "-lc", cmd], cwd=workdir, env=env)

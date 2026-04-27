@@ -61,6 +61,15 @@ def maybe_reset_loader(loader, epoch):
         sampler.set_epoch(epoch)
 
 
+def current_git_hash():
+    env_hash = os.environ.get("SOURCE_GIT_HASH")
+    if env_hash:
+        return env_hash
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], capture_output=True, text=True
+    ).stdout.strip()
+
+
 @torch.no_grad()
 def plot_error_spectrum(result):
     """Log-log eigenvalue spectra of states, predictions, and prediction errors."""
@@ -356,7 +365,7 @@ def save_checkpoint(config, model, run_id, step):
         exp_id = os.getenv("WANDB_RUN_GROUP", "default")
         run_id = str(run_id)
 
-    workdir = os.environ.get("JEPA_WORKDIR", os.getcwd())
+    workdir = os.environ.get("SOURCE_WORKDIR", os.getcwd())
     ckpt_dir = os.path.join(workdir, "research_results", exp_id, "checkpoints", run_id)
     os.makedirs(ckpt_dir, exist_ok=True)
 
@@ -520,6 +529,8 @@ def train(
     epoch = 0
     pbar = tqdm(total=total_steps, initial=1, desc="Training", dynamic_ncols=True)
     for step in range(1, total_steps + 1):
+        if status is not None:
+            status.note_step(step)
         try:
             batch = next(train_iter)
         except StopIteration:
@@ -654,22 +665,19 @@ def main():
         last_step = int(train_conf["total_steps"])
     except BaseException as exc:
         if status is not None:
-            status.crashed(last_step, exc)
+            status.crashed(None, exc)
         raise
     train_time = time.time() - t0
 
     if global_rank == 0 and final_metrics is not None:
         results_dir = os.path.join(sweep_dir, "results")
         os.makedirs(results_dir, exist_ok=True)
-        git_hash = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True
-        ).stdout.strip()
         metrics = to_scalar_dict(final_metrics)
         result = {
             "config": config,
             "metrics": metrics,
             "train_time_seconds": train_time,
-            "git_hash": git_hash,
+            "git_hash": current_git_hash(),
         }
         with open(os.path.join(results_dir, f"{run_id}.json"), "w") as f:
             json.dump(result, f, indent=2)

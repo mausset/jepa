@@ -56,6 +56,7 @@ class RunStatus:
         self.hostname = socket.gethostname()
         self.start_time = _now()
         self._latest_metrics: dict[str, float] = {}
+        self.step = 0
         self.write(status="running", step=0)
 
     def _write(self, payload: dict) -> None:
@@ -70,6 +71,7 @@ class RunStatus:
         step: int,
         exception: str | None = None,
     ) -> None:
+        self.step = int(step)
         payload = {
             "run_id": self.run_id,
             "status": status,
@@ -89,6 +91,9 @@ class RunStatus:
     def set_wandb_run_id(self, wandb_run_id: str | None) -> None:
         self.wandb_run_id = wandb_run_id
 
+    def note_step(self, step: int) -> None:
+        self.step = int(step)
+
     def heartbeat(self, step: int, metrics: dict[str, float] | None = None) -> None:
         if metrics:
             self._latest_metrics = {**self._latest_metrics, **metrics}
@@ -99,8 +104,10 @@ class RunStatus:
             self._latest_metrics = {**self._latest_metrics, **metrics}
         self.write(status="done", step=step)
 
-    def crashed(self, step: int, exc: BaseException) -> None:
+    def crashed(self, step: int | None, exc: BaseException) -> None:
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        if step is None:
+            step = self.step
         self.write(status="crashed", step=step, exception=tb)
 
 
