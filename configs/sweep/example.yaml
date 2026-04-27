@@ -12,5 +12,4 @@ params:
         min: 0.01
         max: 0.1
         n: 5
-  predictor:
-    context: [8, 12]
+  context: [7, 11]

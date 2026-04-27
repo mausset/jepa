@@ -5,12 +5,14 @@ encoder:
   n_registers: 1
   resolution: 96
 
+context: 15
+
 predictor:
   bottleneck: vae
   arch: vit-s
   latent_dim: 16
   kl_beta: 1.0
-  context: 16
+  context: ${context}
 
 action_decoder:
   enabled: true
@@ -24,7 +26,6 @@ data:
   train_path: data/toy_envs/pointmaze_train.h5
   val_path: data/toy_envs/pointmaze_val.h5
   batch_size: 128
-  sequence_length: 16
   include_actions: true
   num_workers: 8
 

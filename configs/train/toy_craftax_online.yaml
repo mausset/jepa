@@ -6,11 +6,13 @@ encoder:
   # n_registers: 1
   resolution: 96
 
+context: 11
+
 predictor:
   bottleneck: fsq
   arch: vit-s
   fsq_levels: [8,8,8]
-  context: 12
+  context: ${context}
 
 action_decoder:
   enabled: true
@@ -21,7 +23,6 @@ action_decoder:
 
 data:
   kind: craftax_online
-  sequence_length: 12
   batch_size: 64
   frame_size: [96, 96]
   include_actions: true

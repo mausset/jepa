@@ -7,11 +7,13 @@ encoder:
   n_registers: 1
   dropout: 0.1
 
+context: 7
+
 predictor:
   bottleneck: fsq
   arch: vit-s
   fsq_levels: [8]
-  context: 8
+  context: ${context}
   dropout: 0.1
   # projector: true
   # projector_norm: bn
@@ -29,7 +31,6 @@ data:
   train_path: data/toy_envs/keydoor_train.h5
   val_path: data/toy_envs/keydoor_val.h5
   include_actions: true
-  sequence_length: 8
   batch_size: 128
   num_workers: 8
 

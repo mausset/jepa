@@ -5,16 +5,17 @@ encoder:
   resolution: 224
   n_registers: 1
 
+context: 7
+
 predictor:
   arch: vit-s
-  context: 8
+  context: ${context}
   noise_dim: 32
   k: 24
 
 data:
   data_root: data/walking_tours/240p_hevc_ext/
   val_root: data/walking_tours/240p_hevc_ext_val/
-  sequence_length: 8
   photometric: false
   crop_aspect: true
   stride: 1

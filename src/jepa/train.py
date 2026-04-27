@@ -584,7 +584,8 @@ def main():
     config = OmegaConf.to_container(OmegaConf.load(args.config), resolve=True)
 
     train_conf = config["training"]
-    data_conf = config["data"]
+    data_conf = dict(config["data"])
+    data_conf["sequence_length"] = config["context"] + 1
 
     seed = train_conf.get("seed", -1)
     wandb_mode = train_conf.get("wandb", "online")

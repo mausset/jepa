@@ -6,11 +6,13 @@ encoder:
   resolution: 96
   # n_registers: 1
 
+context: 11
+
 predictor:
   bottleneck: fsq
   arch: vit-s
   fsq_levels: [8, 8]
-  context: 12
+  context: ${context}
   # projector: true
   # projector_norm: bn
 
@@ -26,7 +28,6 @@ data:
   train_path: data/toy_envs/sokoban_train.h5
   val_path: data/toy_envs/sokoban_val.h5
   include_actions: true
-  sequence_length: 12
   batch_size: 128
   num_workers: 8
 

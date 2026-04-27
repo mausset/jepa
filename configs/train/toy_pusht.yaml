@@ -6,10 +6,12 @@ encoder:
   n_registers: 1
   resolution: 96
 
+context: 11
+
 predictor:
   bottleneck: none
   arch: vit-s
-  context: 12
+  context: ${context}
 
 action_decoder:
   enabled: true
@@ -22,7 +24,6 @@ data:
   kind: toy_env
   train_path: data/toy_envs/pusht_train.h5
   val_path: data/toy_envs/pusht_val.h5
-  sequence_length: 12
   batch_size: 128
   include_actions: true
   num_workers: 8
