@@ -282,6 +282,21 @@ def save_run_config(run_cfg: DictConfig, cfg_dir: Path, run_id: str) -> Path:
     return cfg_path
 
 
+def run_id_material(run_cfg: DictConfig) -> dict:
+    """Plain-dict view of the run config for hashing into run_id.
+
+    Strips fields that are observability/wiring rather than part of the run's
+    training identity. Equivalent CLI invocations that resolve to the same
+    config collapse to the same run_id; YAML edits that genuinely change the
+    config produce a new run_id.
+    """
+    cfg = OmegaConf.to_container(run_cfg, resolve=True)
+    training = cfg.get("training") if isinstance(cfg, dict) else None
+    if isinstance(training, dict):
+        training.pop("project", None)
+    return cfg
+
+
 # ---------- launch log ----------
 
 
@@ -722,12 +737,10 @@ def build_run_plan(args: argparse.Namespace, cfg: DictConfig, experiment_dir: Pa
     cfg_dir.mkdir(parents=True, exist_ok=True)
 
     # Build and save all run configs
-    cli_overrides = tuple(sorted(args.overrides))
     jobs_info = []
     for overrides, seed in run_specs:
-        run_key = dict(overrides, seed=seed, _cli=cli_overrides)
-        run_id = short_hash(run_key)
         run_cfg = build_run_config(cfg, overrides, seed)
+        run_id = short_hash(run_id_material(run_cfg))
         cfg_path = save_run_config(run_cfg, cfg_dir, run_id)
         jobs_info.append((run_id, cfg_path))
     return RunPlan(combos=combos, seeds=seeds, jobs_info=jobs_info)
