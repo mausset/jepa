@@ -47,17 +47,6 @@ class SMCPlanner(BasePlanner):
             raise ValueError(
                 f"SMCPlanner requires a stochastic bottleneck (fsq or vae), got {wm.bottleneck_type!r}"
             )
-        self.bottleneck_predictor = wm.predictor
-        self.latent_dim = self.bottleneck_predictor.latent_dim
-        self.context = self.bottleneck_predictor.context
-
-    def propagate(self, state_hist):
-        """Sample one latent from the bottleneck's prior and take one predictor step."""
-        M, _, N, _ = state_hist.shape
-        latent = self.bottleneck_predictor.sample_prior((M, 1, N), device=state_hist.device)
-        window = state_hist[:, -self.context :]
-        z_next = self.wm.sample(window, latent=latent)[:, None]
-        return torch.cat([state_hist, z_next], dim=1)
 
     def weights(self, z_curr, z_T_flat, B, P):
         """Normalized weights from squared distance to the goal (per batch)."""
@@ -68,30 +57,30 @@ class SMCPlanner(BasePlanner):
         w = w / w.sum(dim=1, keepdim=True).clamp_min(1e-12)
         return cost, w
 
-    def maybe_resample(self, state_hist, w, B, P):
+    def maybe_resample(self, traj, w, B, P):
         """Stratified resample per batch where ESS drops below threshold."""
-        device = state_hist.device
+        device = traj.device
         ess = 1.0 / w.pow(2).sum(dim=1).clamp_min(1e-12)
         needs_resample = ess < self.ess_threshold * P
         if not needs_resample.any():
-            return state_hist, ess
+            return traj, ess
         ancestors = stratified_resample(w)
         identity = torch.arange(P, device=device)[None, :].expand(B, P)
         ancestors = torch.where(needs_resample[:, None], ancestors, identity)
         offsets = (torch.arange(B, device=device) * P)[:, None]
         flat_ancestors = (ancestors + offsets).reshape(-1)
-        return state_hist[flat_ancestors], ess
+        return traj[flat_ancestors], ess
 
-    def best_trajectory(self, state_hist, z_T_flat, B, P):
+    def best_trajectory(self, traj, z_T_flat, B, P):
         """Per-batch particle with minimum final distance to the goal."""
-        _, _, N, D = state_hist.shape
+        _, _, N, D = traj.shape
         H = self.horizon
-        final_cost = (state_hist[:, -1] - z_T_flat).pow(2).mean(dim=(-2, -1)).float()
+        final_cost = (traj[:, -1] - z_T_flat).pow(2).mean(dim=(-2, -1)).float()
         final_cost = rearrange(final_cost, "(b p) -> b p", b=B, p=P)
         best_idx = final_cost.argmin(dim=1)
-        state_hist_b = rearrange(state_hist, "(b p) t n d -> b p t n d", b=B, p=P)
+        traj_b = rearrange(traj, "(b p) t n d -> b p t n d", b=B, p=P)
         idx_exp = best_idx[:, None, None, None, None].expand(B, 1, H, N, D)
-        return state_hist_b.gather(1, idx_exp).squeeze(1)
+        return traj_b.gather(1, idx_exp).squeeze(1)
 
     @torch.inference_mode()
     def plan(self, z_0, z_T):
@@ -106,7 +95,7 @@ class SMCPlanner(BasePlanner):
         B = z_0.shape[0]
         P = self.population
 
-        state_hist = repeat(z_0, "b n d -> (b p) 1 n d", p=P).contiguous()
+        traj = repeat(z_0, "b n d -> (b p) 1 n d", p=P).contiguous()
         z_T_flat = repeat(z_T, "b n d -> (b p) n d", p=P)
 
         pbar = (
@@ -117,9 +106,9 @@ class SMCPlanner(BasePlanner):
 
         with torch.amp.autocast("cuda"):
             for _ in pbar:
-                state_hist = self.propagate(state_hist)
-                cost, w = self.weights(state_hist[:, -1], z_T_flat, B, P)
-                state_hist, ess = self.maybe_resample(state_hist, w, B, P)
+                traj = self.wm.rollout(traj, horizon=1)
+                cost, w = self.weights(traj[:, -1], z_T_flat, B, P)
+                traj, ess = self.maybe_resample(traj, w, B, P)
 
                 if self.progress_bar:
                     pbar.set_postfix(
@@ -129,6 +118,6 @@ class SMCPlanner(BasePlanner):
                         }
                     )
 
-            best_traj = self.best_trajectory(state_hist, z_T_flat, B, P)
+            best_traj = self.best_trajectory(traj, z_T_flat, B, P)
 
         return torch.cat([best_traj, z_T[:, None]], dim=1)

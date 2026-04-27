@@ -42,31 +42,18 @@ class CEMPlanner(BasePlanner):
             raise ValueError(
                 f"CEMPlanner requires a stochastic bottleneck (fsq or vae), got {wm.bottleneck_type!r}"
             )
-        self.bottleneck_predictor = wm.predictor
-        self.bottleneck_type = wm.bottleneck_type
-        self.latent_dim = self.bottleneck_predictor.latent_dim
-        self.context = self.bottleneck_predictor.context
 
-        if self.bottleneck_type == "fsq":
-            self.K = self.bottleneck_predictor.fsq.codebook_size
+    @property
+    def bottleneck_type(self):
+        return self.wm.bottleneck_type
 
-    def rollout_with_latents(self, z_0, latent_seq):
-        """Autoregressive rollout with caller-specified latents, windowed to
-        the predictor's training context so horizon > context stays in-distribution.
+    @property
+    def latent_dim(self):
+        return self.wm.predictor.latent_dim
 
-        Args:
-            z_0: (M, N, D)
-            latent_seq: (M, H-1, N, latent_dim)
-        Returns:
-            (M, H, N, D) trajectory including z_0 at index 0.
-        """
-        state_hist = z_0[:, None]
-        for t in range(self.horizon - 1):
-            latent_t = latent_seq[:, t : t + 1]
-            window = state_hist[:, -self.context :]
-            z_next = self.wm.sample(window, latent=latent_t)[:, None]
-            state_hist = torch.cat([state_hist, z_next], dim=1)
-        return state_hist
+    @property
+    def K(self):
+        return self.wm.predictor.fsq.codebook_size
 
     def init_search_state(self, B, N, device):
         """Initialize the per-(step, token) search distribution."""
@@ -95,7 +82,7 @@ class CEMPlanner(BasePlanner):
                 logits=logits[:, None].expand(B, P, H - 1, -1, -1)
             )
             codes = dist.sample()  # (B, P, H-1, N)
-            codebook = self.bottleneck_predictor.fsq.implicit_codebook.to(device)
+            codebook = self.wm.predictor.fsq.implicit_codebook.to(device)
             latents = codebook[codes]  # (B, P, H-1, N, latent_dim)
             return codes, latents
 
@@ -145,7 +132,7 @@ class CEMPlanner(BasePlanner):
 
                 latents_flat = rearrange(latents, "b p h n d -> (b p) h n d")
                 z_0_flat = repeat(z_0, "b n d -> (b p) n d", p=P)
-                traj_flat = self.rollout_with_latents(z_0_flat, latents_flat)  # (B*P, H, N, D)
+                traj_flat = self.wm.rollout(z_0_flat[:, None], latents=latents_flat)  # (B*P, H, N, D)
 
                 z_T_rep = repeat(z_T, "b n d -> (b p) n d", p=P)
                 cost_flat = (traj_flat[:, -1] - z_T_rep).pow(2).mean(dim=(-2, -1))
