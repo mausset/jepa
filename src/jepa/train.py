@@ -472,6 +472,8 @@ def val_epoch(model, loader, loss_fn, step, max_steps=500):
     mean_metrics = {}
     pbar = tqdm(loader, desc="Validation", leave=False)
     for i, batch in enumerate(pbar):
+        if i >= max_steps:
+            break
         x, actions = unpack_batch(batch)
         with torch.amp.autocast("cuda"):  # type: ignore
             result = model(x, actions)
@@ -481,9 +483,6 @@ def val_epoch(model, loader, loss_fn, step, max_steps=500):
 
         for k, v in itertools.chain(loss.items(), metrics.items()):
             update_metric_store(mean_metrics, k, v)
-
-        if i > max_steps:
-            break
 
     mean_metrics = finalize_metric_store(mean_metrics)
     log_progress(None, step, {}, mean_metrics, stage="val")
