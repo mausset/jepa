@@ -62,14 +62,26 @@ class JEPA(nn.Module):
         return rearrange(state, "(b t) n d -> b t n d", b=B, t=T)
 
     def predict_all(self, state):
-        """Prediction for every position in the sequence.
+        """One-step-ahead predictions at every position; output[t] predicts state[t+1].
 
-        With no bottleneck, returns (B, T, N, D) where output[:, t] predicts state[:, t+1].
-        With fsq/vae, returns (B, T-1, N, D) conditioned on the inferred latent.
+        Chunks the input non-overlappingly: each chunk takes context+1 input
+        frames (the predictor's training shape) and yields context predictions.
+        Adjacent chunks share one boundary frame as input but never produce
+        overlapping output predictions.
+
+        Returns (B, T-1, N, D).
         """
-        proj_state = self.proj_in(state)
-        pred = self.predictor(proj_state)["pred"]
-        return self.proj_out(pred)
+        T = state.shape[1]
+        C = self.context
+        out = []
+        for start in range(0, T - 1, C):
+            end = min(start + C + 1, T)
+            win = state[:, start:end]
+            win_pred = self.proj_out(self.predictor(self.proj_in(win))["pred"])
+            if not self.has_bottleneck:
+                win_pred = win_pred[:, :-1]
+            out.append(win_pred)
+        return torch.cat(out, dim=1)
 
     def predict(self, state):
         """Mean-style one-step prediction of frame following `state`.
@@ -79,60 +91,53 @@ class JEPA(nn.Module):
         """
         if self.has_bottleneck:
             raise ValueError("predict() is unconditional; use sample() with a bottleneck")
-        proj_state = self.proj_in(state)
-        pred = self.predictor(proj_state)["pred"]
-        return self.proj_out(pred[:, -1])
-
-    def sample_mean(self, state):
-        mu = self.predict(state)
-        D = mu.shape[-1]
-        sq_norm = (mu * mu).sum(dim=-1, keepdim=True) / D
-        sigma = (1.0 - sq_norm).clamp_min(0.0).sqrt()
-        return mu + sigma * torch.randn_like(mu)
+        return self.predict_all(state)[:, -1]
 
     def sample(self, state, latent=None):
         """Sample next frame. Requires a bottleneck; uses the prior over latents."""
         if not self.has_bottleneck:
-            if latent is not None:
-                raise ValueError("sample(latent=...) not supported without a bottleneck")
-            return self.sample_mean(state)
+            raise ValueError("sample() requires a bottleneck (fsq or vae)")
         return self.proj_out(self.predictor.sample(self.proj_in(state), latent=latent))[:, -1]
 
     def decode_actions(self, traj):
-        """Per-step action predictions, windowed to training context."""
+        """Per-step action predictions, windowed to the action decoder's
+        training input length (context + 1, matching data.sequence_length)."""
         T = traj.shape[1]
-        if T <= self.context:
+        L = self.context + 1
+        if T <= L:
             return self.action_decoder(traj)["pred"]
         out = []
         for t in range(1, T):
-            start = max(0, t + 1 - self.context)
+            start = max(0, t + 1 - L)
             out.append(self.action_decoder(traj[:, start : t + 1])["pred"][:, -1])
         return torch.stack(out, dim=1)
 
-    def rollout(self, z_0, horizon, use_latent):
-        """Autoregressive rollout from z_0 under the model, no planning."""
-        sample_fn = self.sample if use_latent else self.sample_mean
-        state_hist = z_0[:, None]
-        out = []
-        for _ in range(horizon):
-            z_next = sample_fn(state_hist)[:, None]
-            out.append(z_next)
-            state_hist = torch.cat([state_hist, z_next], dim=1)
-        return torch.cat(out, dim=1)
+    def rollout(self, traj, horizon=None, latents=None):
+        """Append autoregressive steps to `traj`. Provide exactly one of
+        `horizon` or `latents`.
 
-    def residuals(self, trajectory, use_latent):
-        """Per-step prediction error of a trajectory under the transition model."""
-        if use_latent:
-            pred = self.predict_all(trajectory)
-            return (pred - trajectory[:, 1:]).pow(2).mean(dim=-1).mean(dim=2)
+        Each step samples a window of length `context` from the trajectory tail
+        so RoPE positions stay within the predictor's training distribution.
 
-        mu_all = self.predict_all(trajectory[:, :-1])
-        targets = trajectory[:, 1:]
-        D = mu_all.shape[-1]
-        alpha = (mu_all * mu_all).sum(dim=-1, keepdim=True) / D
-        sigma_sq = (1.0 - alpha).clamp_min(1e-8)
-        res = (targets - mu_all).pow(2).sum(dim=-1, keepdim=True) / (D * sigma_sq)
-        return res.squeeze(-1).mean(dim=2)
+        Args:
+            traj:    (B, T, N, D) prefix; for a fresh rollout pass z_0[:, None].
+            horizon: int number of steps to roll out from the prior.
+            latents: (B, H, N, latent_dim) caller-provided latents; H steps.
+
+        Returns:
+            (B, T + H, N, D) — prefix included.
+        """
+        if (horizon is None) == (latents is None):
+            raise ValueError("provide exactly one of `horizon`, `latents`")
+        if latents is not None and not self.has_bottleneck:
+            raise ValueError("`latents` requires a bottleneck (fsq or vae)")
+        H = horizon if horizon is not None else latents.shape[1]
+        for t in range(H):
+            window = traj[:, -self.context :]
+            latent_t = None if latents is None else latents[:, t : t + 1]
+            z_next = self.sample(window, latent=latent_t)[:, None]
+            traj = torch.cat([traj, z_next], dim=1)
+        return traj
 
     def forward(self, x, actions=None):
         state = self.encode(x)
