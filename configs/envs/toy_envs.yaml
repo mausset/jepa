@@ -23,11 +23,11 @@ envs:
 
   push:
     kind: push
-    env_id: FetchPush-v3
-    train_episodes: 20000
+    env_id: FetchPush-v4
+    train_episodes: 10000
     val_episodes: 2000
-    max_steps: 32
-    action_repeat: 10
+    max_steps: 100
+    action_repeat: 5
 
   keydoor:
     kind: keydoor
@@ -46,10 +46,10 @@ envs:
 
   pusht:
     kind: pusht
-    train_episodes: 20000
+    train_episodes: 10000
     val_episodes: 2000
-    max_steps: 32
-    max_delta: 1.0
+    max_steps: 100
+    max_delta: 0.5
 
   craftax:
     kind: craftax
