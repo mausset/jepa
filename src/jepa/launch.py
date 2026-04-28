@@ -264,8 +264,14 @@ class TrainJob:
 
 
 def build_run_config(base_cfg: DictConfig, overrides: dict[str, Any], seed: int) -> DictConfig:
-    """Clone base config, apply sweep overrides and seed, strip launcher-only keys."""
-    run_cfg = OmegaConf.create(OmegaConf.to_container(base_cfg, resolve=True))
+    """Clone base config, apply sweep overrides and seed, strip launcher-only keys.
+
+    The clone preserves OmegaConf interpolations (`${foo}`) so a sweep that
+    overrides an interpolation source (e.g. a top-level `detach: false` referenced
+    by `predictor.detach_state: ${detach}`) propagates to dependent fields.
+    Resolution is deferred until consumers call `to_container(resolve=True)`.
+    """
+    run_cfg = OmegaConf.create(OmegaConf.to_yaml(base_cfg))
     OmegaConf.update(run_cfg, "training.seed", seed)
     for k, v in overrides.items():
         OmegaConf.update(run_cfg, k, v)
