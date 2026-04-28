@@ -543,6 +543,7 @@ class LaunchPaths:
     cwd: Path
     workdir: Path
     config_dir: str
+    caller_repo: Path
 
 
 @dataclass(frozen=True)
@@ -610,9 +611,14 @@ def resolve_launch_paths(args: argparse.Namespace) -> LaunchPaths:
         workdir = args.workdir.resolve()
     # Configs come from the *caller's* worktree, not main — experiment-local
     # configs (e.g. new train presets) live on the dev branch and shouldn't
-    # need to land on main to be picked up.
-    config_dir = str((find_caller_repo(cwd) / "configs").resolve())
-    return LaunchPaths(cwd=cwd, workdir=workdir, config_dir=config_dir)
+    # need to land on main to be picked up. Caller worktree is also the
+    # PYTHONPATH source for `--smoke` runs, so smokes test the dev branch's
+    # code rather than main's editable install.
+    caller_repo = find_caller_repo(cwd).resolve()
+    config_dir = str((caller_repo / "configs").resolve())
+    return LaunchPaths(
+        cwd=cwd, workdir=workdir, config_dir=config_dir, caller_repo=caller_repo
+    )
 
 
 def validate_launch_request(args: argparse.Namespace) -> None:
@@ -885,10 +891,15 @@ def main(argv=None):
         wandb_group = wandb_group_for(study, args.experiment)
         code_hash = (launch_record["git"] or {}).get("hash")
 
+        # Smokes import code from the caller's dev worktree so they validate the
+        # branch under iteration. Non-smokes import from the tag-pinned snapshot
+        # to preserve reproducibility.
+        runtime_worktree = paths.caller_repo if args.smoke else snapshot.worktree_path
+
         if use_slurm:
             slurm_job_ids = _submit_slurm(
                 args, paths.workdir, cluster, run_plan.jobs_info, experiment_dir,
-                worktree=snapshot.worktree_path, wandb_run_group=wandb_group,
+                worktree=runtime_worktree, wandb_run_group=wandb_group,
                 code_hash=code_hash,
             )
             submitted = True
@@ -905,7 +916,7 @@ def main(argv=None):
             submitted = True  # local run starts now; worktree must persist
             _run_local(
                 paths.workdir, cluster, run_plan.jobs_info, args.experiment,
-                worktree=snapshot.worktree_path, wandb_run_group=wandb_group,
+                worktree=runtime_worktree, wandb_run_group=wandb_group,
                 code_hash=code_hash,
             )
     except BaseException:
