@@ -20,16 +20,6 @@ import yaml
 from jepa.launch import find_main_repo, research_results_dir
 
 
-METRIC_KEYS = (
-    "val/mse",
-    "val/kl",
-    "val/state_sigreg",
-    "val/action_acc",
-    "val/rollout_action_acc",
-)
-METRIC_HEADERS = ("mse", "kl", "sigreg", "acc", "rollout")
-
-
 def flatten(d: dict, prefix: str = "") -> dict[str, Any]:
     out: dict[str, Any] = {}
     for k, v in d.items():
@@ -122,6 +112,16 @@ def render_experiment(experiment_dir: Path, markdown: bool = False) -> None:
     if swept == ["training.seed"]:
         swept = []
 
+    # Discover the union of metric keys present across runs. Sorted alpha,
+    # with `val/`-prefixed keys grouped first.
+    metric_keys: set[str] = set()
+    for r in runs:
+        m = r["status"].get("latest_metrics") or {}
+        metric_keys.update(m.keys())
+    metric_keys_sorted = sorted(
+        metric_keys, key=lambda k: (not k.startswith("val/"), k)
+    )
+
     rows = []
     for r in runs:
         flat = flatten(r["config"])
@@ -132,7 +132,7 @@ def render_experiment(experiment_dir: Path, markdown: bool = False) -> None:
         row["status"] = st.get("status", "-")
         row["step"] = st.get("step", 0) or 0
         row["total"] = st.get("total_steps", 0) or 0
-        for mk in METRIC_KEYS:
+        for mk in metric_keys_sorted:
             row[mk] = m.get(mk)
         rows.append(row)
 
@@ -145,9 +145,11 @@ def render_experiment(experiment_dir: Path, markdown: bool = False) -> None:
 
     rows.sort(key=sort_key)
 
+    # Use the full metric key as header so train/X and val/X don't collide.
+    metric_headers = list(metric_keys_sorted)
     headers = [k.split(".")[-1] for k in swept] + [
         "run_id", "status", "step", "%",
-        *METRIC_HEADERS,
+        *metric_headers,
     ]
 
     def stringify(row):
@@ -156,7 +158,7 @@ def render_experiment(experiment_dir: Path, markdown: bool = False) -> None:
         out.append(row["status"])
         out.append(str(row["step"]))
         out.append(f"{100*row['step']/row['total']:.1f}%" if row["total"] else "-")
-        for mk in METRIC_KEYS:
+        for mk in metric_keys_sorted:
             out.append(fmt_metric(row.get(mk)))
         return out
 
