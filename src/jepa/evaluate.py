@@ -16,6 +16,7 @@ from jepa.launch import (
     git_info,
     prepend_pythonpath,
     research_results_dir,
+    short_hash,
     validate_name,
 )
 
@@ -52,10 +53,16 @@ def _planning_runner_factory(planner: str):
     return runner
 
 
+def _planning_basename(planner: str):
+    def basename(planner_kwargs: dict) -> str:
+        return f"planning_{planner}_{short_hash(planner_kwargs)}.json"
+    return basename
+
+
 EVALS: dict[str, dict] = {
     "planning_mppi": {
         "runner": _planning_runner_factory("mppi"),
-        "output_basename": "planning_mppi.json",
+        "output_basename": _planning_basename("mppi"),
     },
 }
 
@@ -111,7 +118,7 @@ class EvalJob:
 
         for eval_name in self.eval_names:
             spec = EVALS[eval_name]
-            output_path = out_dir / spec["output_basename"]
+            output_path = out_dir / spec["output_basename"](self.planner_kwargs)
             argv = spec["runner"](
                 self.ckpt_path, output_path, self.env_name, self.planner_kwargs
             )
@@ -191,9 +198,14 @@ def discover_runs(experiment_dir: Path, runs_filter: str | None, include_crashed
     return out
 
 
-def all_outputs_exist(experiment_eval_dir: Path, wandb_run_id: str, eval_names: list[str]) -> bool:
+def all_outputs_exist(
+    experiment_eval_dir: Path, wandb_run_id: str, eval_names: list[str], planner_kwargs: dict
+) -> bool:
     out_dir = experiment_eval_dir / wandb_run_id
-    return all((out_dir / EVALS[name]["output_basename"]).exists() for name in eval_names)
+    return all(
+        (out_dir / EVALS[name]["output_basename"](planner_kwargs)).exists()
+        for name in eval_names
+    )
 
 
 # ---------- launch ----------
@@ -341,10 +353,13 @@ def main(argv=None):
     runs = discover_runs(experiment_dir, args.runs, args.include_crashed)
 
     experiment_eval_dir = experiment_dir / "eval"
+    planner_kwargs = build_planner_kwargs(args)
     if not args.force:
         runs = [
             r for r in runs
-            if not all_outputs_exist(experiment_eval_dir, r["wandb_run_id"], eval_names)
+            if not all_outputs_exist(
+                experiment_eval_dir, r["wandb_run_id"], eval_names, planner_kwargs
+            )
         ]
 
     if not runs:
@@ -354,7 +369,6 @@ def main(argv=None):
     print(f"Evaluating {len(runs)} runs × {len(eval_names)} evals on cluster=`{args.cluster}` "
           f"(slurm={use_slurm}, timeout={args.timeout_min}m)")
 
-    planner_kwargs = build_planner_kwargs(args)
     setup_commands = list(cluster.get("setup_commands", []) or [])
 
     jobs = []
