@@ -54,8 +54,8 @@ def _planning_runner_factory(planner: str):
 
 
 def _planning_basename(planner: str):
-    def basename(planner_kwargs: dict) -> str:
-        return f"planning_{planner}_{short_hash(planner_kwargs)}.json"
+    def basename(env_name: str, planner_kwargs: dict) -> str:
+        return f"planning_{planner}_{env_name}_{short_hash(planner_kwargs)}.json"
     return basename
 
 
@@ -118,7 +118,7 @@ class EvalJob:
 
         for eval_name in self.eval_names:
             spec = EVALS[eval_name]
-            output_path = out_dir / spec["output_basename"](self.planner_kwargs)
+            output_path = out_dir / spec["output_basename"](self.env_name, self.planner_kwargs)
             argv = spec["runner"](
                 self.ckpt_path, output_path, self.env_name, self.planner_kwargs
             )
@@ -199,11 +199,15 @@ def discover_runs(experiment_dir: Path, runs_filter: str | None, include_crashed
 
 
 def all_outputs_exist(
-    experiment_eval_dir: Path, wandb_run_id: str, eval_names: list[str], planner_kwargs: dict
+    experiment_eval_dir: Path,
+    wandb_run_id: str,
+    eval_names: list[str],
+    env_name: str,
+    planner_kwargs: dict,
 ) -> bool:
     out_dir = experiment_eval_dir / wandb_run_id
     return all(
-        (out_dir / EVALS[name]["output_basename"](planner_kwargs)).exists()
+        (out_dir / EVALS[name]["output_basename"](env_name, planner_kwargs)).exists()
         for name in eval_names
     )
 
@@ -358,7 +362,8 @@ def main(argv=None):
         runs = [
             r for r in runs
             if not all_outputs_exist(
-                experiment_eval_dir, r["wandb_run_id"], eval_names, planner_kwargs
+                experiment_eval_dir, r["wandb_run_id"], eval_names,
+                args.env_name, planner_kwargs,
             )
         ]
 
