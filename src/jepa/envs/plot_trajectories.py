@@ -10,6 +10,7 @@ import argparse
 from pathlib import Path
 
 import h5py
+import hdf5plugin  # noqa: F401  -- registers Zstd filter for compressed datasets
 import matplotlib.pyplot as plt
 import numpy as np
 

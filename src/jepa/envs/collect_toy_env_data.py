@@ -6,11 +6,14 @@ import multiprocessing as mp
 from pathlib import Path
 
 import h5py
+import hdf5plugin
 import numpy as np
 import yaml
 from tqdm import tqdm
 
 from jepa.envs.toy_envs import build_toy_env, resize_nn, sanitize_name
+
+FRAME_COMPRESSION = hdf5plugin.Zstd(clevel=1)
 
 PARALLEL_ENVS = {"pointmaze", "push", "pusht", "keydoor", "sokoban"}
 JAX_ENVS = {"craftax"}
@@ -170,7 +173,13 @@ def write_episodes(handle: h5py.File, episodes: list, offset: int):
     for i, episode in enumerate(episodes):
         group = handle.create_group(f"{offset + i:06d}")
         group.attrs["episode_length"] = int(episode["episode_length"])
-        group.create_dataset("frames", data=episode["frames"])
+        frames = episode["frames"]
+        group.create_dataset(
+            "frames",
+            data=frames,
+            chunks=(1,) + frames.shape[1:],
+            **FRAME_COMPRESSION,
+        )
         group.create_dataset("states", data=episode["states"])
         group.create_dataset("actions", data=episode["actions"])
 
@@ -269,7 +278,7 @@ def main():
     with open(args.config, "r") as handle:
         config = yaml.safe_load(handle)
 
-    frame_size = tuple(config.get("frame_size", [96, 96]))
+    default_frame_size = tuple(config.get("frame_size", [96, 96]))
     output_dir = Path(config.get("output_dir", "data/toy_envs"))
     base_seed = int(config.get("seed", 0))
 
@@ -281,6 +290,7 @@ def main():
         train_seed = base_seed + env_index * 2
         val_seed = base_seed + env_index * 2 + 1
         env_path = sanitize_name(env_name)
+        frame_size = tuple(env_config.get("frame_size", default_frame_size))
 
         collect_and_save_split(
             env_config, "train", frame_size, train_seed,

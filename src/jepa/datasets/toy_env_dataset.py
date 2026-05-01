@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import h5py
+import hdf5plugin  # noqa: F401  -- registers Zstd filter for read
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
