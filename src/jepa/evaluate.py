@@ -2,6 +2,7 @@ import argparse
 import datetime
 import json
 import os
+import secrets
 import shlex
 import socket
 import subprocess
@@ -16,7 +17,6 @@ from jepa.launch import (
     git_info,
     prepend_pythonpath,
     research_results_dir,
-    short_hash,
     validate_name,
 )
 
@@ -54,8 +54,8 @@ def _planning_runner_factory(planner: str):
 
 
 def _planning_basename(planner: str):
-    def basename(env_name: str, planner_kwargs: dict) -> str:
-        return f"planning_{planner}_{env_name}_{short_hash(planner_kwargs)}.json"
+    def basename(env_name: str) -> str:
+        return f"planning_{planner}_{env_name}_{secrets.token_hex(3)}.json"
     return basename
 
 
@@ -76,7 +76,6 @@ class EvalJob:
         *,
         workdir: Path,
         run_id: str,
-        wandb_run_id: str,
         checkpoint: Path,
         experiment_eval_dir: Path,
         eval_names: list[str],
@@ -89,7 +88,6 @@ class EvalJob:
     ):
         self.workdir = Path(workdir)
         self.run_id = run_id
-        self.wandb_run_id = wandb_run_id
         self.ckpt_path = Path(checkpoint)
         self.experiment_eval_dir = Path(experiment_eval_dir)
         self.eval_names = list(eval_names)
@@ -113,12 +111,12 @@ class EvalJob:
             env["SOURCE_GIT_HASH"] = self.code_hash
         prepend_pythonpath(env, self.worktree)
 
-        out_dir = self.experiment_eval_dir / self.wandb_run_id
+        out_dir = self.experiment_eval_dir / self.run_id
         out_dir.mkdir(parents=True, exist_ok=True)
 
         for eval_name in self.eval_names:
             spec = EVALS[eval_name]
-            output_path = out_dir / spec["output_basename"](self.env_name, self.planner_kwargs)
+            output_path = out_dir / spec["output_basename"](self.env_name)
             argv = spec["runner"](
                 self.ckpt_path, output_path, self.env_name, self.planner_kwargs
             )
@@ -142,7 +140,6 @@ class EvalJob:
             EvalJob(
                 workdir=self.workdir,
                 run_id=self.run_id,
-                wandb_run_id=self.wandb_run_id,
                 checkpoint=self.ckpt_path,
                 experiment_eval_dir=self.experiment_eval_dir,
                 eval_names=self.eval_names,
@@ -160,8 +157,7 @@ class EvalJob:
 
 
 def discover_runs(experiment_dir: Path, runs_filter: str | None, include_crashed: bool) -> list[dict]:
-    """Return run records (run_id, wandb_run_id, status, checkpoint) for the
-    runs we'll evaluate.
+    """Return run records (run_id, status, checkpoint) for the runs we'll evaluate.
 
     Filters: by status (`done` always; `crashed` only with --include-crashed),
     optionally by an explicit run_id allowlist (--runs).
@@ -181,35 +177,17 @@ def discover_runs(experiment_dir: Path, runs_filter: str | None, include_crashed
 
     out = []
     for s in selected:
-        wandb_id = s.get("wandb_run_id")
-        if wandb_id is None:
-            print(f"Warning: status for {s['run_id']} has no wandb_run_id; skipping")
-            continue
-        ckpt = experiment_dir / "checkpoints" / wandb_id / "checkpoint.pth"
+        run_id = s["run_id"]
+        ckpt = experiment_dir / "checkpoints" / run_id / "checkpoint.pth"
         if not ckpt.exists():
-            print(f"Warning: no checkpoint at {ckpt}; skipping run {s['run_id']}")
+            print(f"Warning: no checkpoint at {ckpt}; skipping run {run_id}")
             continue
         out.append({
-            "run_id": s["run_id"],
-            "wandb_run_id": wandb_id,
+            "run_id": run_id,
             "status": s["status"],
             "checkpoint": ckpt,
         })
     return out
-
-
-def all_outputs_exist(
-    experiment_eval_dir: Path,
-    wandb_run_id: str,
-    eval_names: list[str],
-    env_name: str,
-    planner_kwargs: dict,
-) -> bool:
-    out_dir = experiment_eval_dir / wandb_run_id
-    return all(
-        (out_dir / EVALS[name]["output_basename"](env_name, planner_kwargs)).exists()
-        for name in eval_names
-    )
 
 
 # ---------- launch ----------
@@ -247,7 +225,7 @@ def submit_slurm_eval(
 
 def run_local_eval(jobs: list[EvalJob]) -> None:
     for job in jobs:
-        print(f"Evaluating run {job.run_id} ({job.wandb_run_id})")
+        print(f"Evaluating run {job.run_id}")
         job()
 
 
@@ -304,8 +282,6 @@ def main(argv=None):
                    help="Comma-separated eval names from the registry.")
     p.add_argument("--cluster", default="thin",
                    help="Cluster name (yaml under configs/cluster/). Defaults to thin.")
-    p.add_argument("--force", action="store_true",
-                   help="Re-run evals even if their JSON already exists.")
     p.add_argument("--runs", default=None,
                    help="Comma-separated run_ids to evaluate (default: all `done` runs).")
     p.add_argument("--include-crashed", action="store_true",
@@ -358,17 +334,9 @@ def main(argv=None):
 
     experiment_eval_dir = experiment_dir / "eval"
     planner_kwargs = build_planner_kwargs(args)
-    if not args.force:
-        runs = [
-            r for r in runs
-            if not all_outputs_exist(
-                experiment_eval_dir, r["wandb_run_id"], eval_names,
-                args.env_name, planner_kwargs,
-            )
-        ]
 
     if not runs:
-        print("Nothing to evaluate (all selected runs already have outputs; pass --force to redo).")
+        print("Nothing to evaluate (no selected runs with checkpoints).")
         return
 
     print(f"Evaluating {len(runs)} runs × {len(eval_names)} evals on cluster=`{args.cluster}` "
@@ -381,7 +349,6 @@ def main(argv=None):
         jobs.append(EvalJob(
             workdir=workdir,
             run_id=r["run_id"],
-            wandb_run_id=r["wandb_run_id"],
             checkpoint=r["checkpoint"],
             experiment_eval_dir=experiment_eval_dir,
             eval_names=eval_names,
@@ -414,7 +381,6 @@ def main(argv=None):
         "env_name": args.env_name,
         "n_runs": len(jobs),
         "run_ids": [j.run_id for j in jobs],
-        "wandb_run_ids": [j.wandb_run_id for j in jobs],
         "git": git_info(cwd),
         "code_git": code_git,
         "worktree": str(worktree),

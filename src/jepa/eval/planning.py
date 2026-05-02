@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import secrets
 import statistics
 import subprocess
 import warnings
@@ -430,8 +431,8 @@ def success_curve(distances, thresholds, n):
 def resolve_output_path(args):
     """Resolve where to write the eval JSON.
 
-    Default convention: `<sweep>/eval/<run_id>/planning_<planner>.json`. The
-    `<run_id>` here is the wandb run id (the checkpoint dir name); each
+    Default convention: `<sweep>/eval/<run_id>/planning_<planner>_<env>_<hex>.json`.
+    The `<run_id>` here is the artifact run id (the checkpoint dir name); each
     checkpoint gets its own subdir so multi-eval outputs stay grouped.
     """
     if args.output is not None:
@@ -439,7 +440,8 @@ def resolve_output_path(args):
     ckpt = Path(args.checkpoint).resolve()
     run_id = ckpt.parent.name
     sweep_dir = ckpt.parent.parent.parent
-    return sweep_dir / "eval" / run_id / f"planning_{args.planner}.json"
+    name = f"planning_{args.planner}_{args.env_name}_{secrets.token_hex(3)}.json"
+    return sweep_dir / "eval" / run_id / name
 
 
 def require_latent_model(model) -> None:
@@ -457,6 +459,12 @@ def build_eval_result(
     episodes: list[dict[str, Any]],
     attempts: int,
 ) -> dict[str, Any]:
+    planner_kwargs = {
+        "num_episodes": args.num_episodes,
+        "horizon": args.horizon,
+        "batch_size": args.batch_size,
+        **planner_cfg,
+    }
     return {
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "step": step,
@@ -464,6 +472,7 @@ def build_eval_result(
         "horizon": args.horizon,
         "planner_name": args.planner,
         "planner": planner_cfg,
+        "planner_kwargs": planner_kwargs,
         "batch_size": args.batch_size,
         "num_episodes_requested": args.num_episodes,
         "num_episodes_used": len(episodes),

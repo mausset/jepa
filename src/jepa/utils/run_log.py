@@ -35,7 +35,7 @@ class RunStatus:
     """Atomically writes a per-run status JSON. Rank-0 only.
 
     Fields capture enough state to answer "is run X alive, where, and how is it doing"
-    without attaching to the process or querying W&B.
+    without attaching to the process.
     """
 
     def __init__(
@@ -45,14 +45,12 @@ class RunStatus:
         *,
         total_steps: int,
         slurm_job_id: str | None,
-        wandb_run_id: str | None = None,
     ):
         self.path = Path(sweep_dir) / "status" / f"{run_id}.json"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.run_id = run_id
         self.total_steps = total_steps
         self.slurm_job_id = slurm_job_id
-        self.wandb_run_id = wandb_run_id
         self.hostname = socket.gethostname()
         self.start_time = _now()
         self._latest_metrics: dict[str, float] = {}
@@ -82,14 +80,10 @@ class RunStatus:
             "last_heartbeat": _now(),
             "hostname": self.hostname,
             "slurm_job_id": self.slurm_job_id,
-            "wandb_run_id": self.wandb_run_id,
             "latest_metrics": self._latest_metrics,
             "exception": exception,
         }
         self._write(payload)
-
-    def set_wandb_run_id(self, wandb_run_id: str | None) -> None:
-        self.wandb_run_id = wandb_run_id
 
     def note_step(self, step: int) -> None:
         self.step = int(step)

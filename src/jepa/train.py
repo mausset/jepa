@@ -355,18 +355,10 @@ def log_progress(
         wandb.log({**loss, **metrics, **plot_data}, step=step)
 
 
-def save_checkpoint(config, model, run_id, step):
+def save_checkpoint(config, model, sweep_dir, run_id, step):
     module = model.module if hasattr(model, "module") else model
 
-    if wandb.run:
-        exp_id = wandb.run.group or os.getenv("WANDB_RUN_GROUP", "default")
-        run_id = wandb.run.id  # ensure W&B run id
-    else:
-        exp_id = os.getenv("WANDB_RUN_GROUP", "default")
-        run_id = str(run_id)
-
-    workdir = os.environ.get("SOURCE_WORKDIR", os.getcwd())
-    ckpt_dir = os.path.join(workdir, "research_results", exp_id, "checkpoints", run_id)
+    ckpt_dir = os.path.join(sweep_dir, "checkpoints", run_id)
     os.makedirs(ckpt_dir, exist_ok=True)
 
     step_name = f"step_{step:08d}.pth"
@@ -376,7 +368,7 @@ def save_checkpoint(config, model, run_id, step):
             "model": module.state_dict(),
             "config": config,
             "step": step + 1,
-            "wandb_run_id": run_id,
+            "run_id": run_id,
         },
         step_path,
     )
@@ -505,6 +497,8 @@ def train(
     optimizer,
     opt_step,
     config,
+    sweep_dir,
+    run_id,
     rank=0,
     status: RunStatus | None = None,
     metrics_logger: MetricsLogger | None = None,
@@ -571,10 +565,10 @@ def train(
 
         if ckpt_interval > 0 and step % ckpt_interval == 0 and rank == 0:
             print("Saving checkpoint")
-            save_checkpoint(config, model, wandb.run.id if wandb.run else "local", step)
+            save_checkpoint(config, model, sweep_dir, run_id, step)
 
     if rank == 0:
-        save_checkpoint(config, model, wandb.run.id if wandb.run else "local", step)  # type: ignore
+        save_checkpoint(config, model, sweep_dir, run_id, step)  # type: ignore
 
     final_metrics = val_epoch(model, val_loader, loss_fn, step, max_steps=final_val_max_steps)  # type: ignore
     if metrics_logger is not None:
@@ -635,6 +629,9 @@ def main():
             "project": config["training"]["project"],
             "config": config,
             "mode": wandb_mode,
+            "id": run_id,
+            "name": run_id,
+            "resume": "never",
         }
         wandb.init(**wandb_init_args)
         status = RunStatus(
@@ -642,7 +639,6 @@ def main():
             run_id,
             total_steps=int(train_conf["total_steps"]),
             slurm_job_id=slurm_job_id_from_env(),
-            wandb_run_id=wandb.run.id if wandb.run else None,
         )
         metrics_logger = MetricsLogger(sweep_dir, run_id)
 
@@ -657,6 +653,8 @@ def main():
             optimizer,
             opt_step,
             config,
+            sweep_dir,
+            run_id,
             rank=global_rank,
             status=status,
             metrics_logger=metrics_logger,

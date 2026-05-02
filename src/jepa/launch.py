@@ -4,6 +4,7 @@ import itertools
 import json
 import os
 import re
+import secrets
 import shlex
 import socket
 import subprocess
@@ -145,13 +146,6 @@ def cartesian(grid: dict[str, list[Any]]) -> list[dict[str, Any]]:
 # ---------- utils ----------
 
 
-def short_hash(d: dict[str, Any]) -> str:
-    blob = json.dumps(d, sort_keys=True, separators=(",", ":"), default=str).encode()
-    import hashlib
-
-    return hashlib.sha1(blob).hexdigest()[:8]
-
-
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
@@ -181,7 +175,6 @@ class TrainJob:
         workdir: Path,
         cfg_path: Path,
         experiment: str,
-        run_id: str,
         gpus_per_node: int,
         nodes: int,
         setup_commands: list[str],
@@ -193,7 +186,6 @@ class TrainJob:
         self.workdir = workdir
         self.cfg_path = cfg_path
         self.experiment = experiment
-        self.run_id = run_id
         self.gpus_per_node = int(gpus_per_node)
         self.nodes = int(nodes)
         self.setup_commands = list(setup_commands)
@@ -248,7 +240,6 @@ class TrainJob:
                 workdir=self.workdir,
                 cfg_path=self.cfg_path,
                 experiment=self.experiment,
-                run_id=self.run_id,
                 gpus_per_node=self.gpus_per_node,
                 nodes=self.nodes,
                 setup_commands=self.setup_commands,
@@ -286,21 +277,6 @@ def save_run_config(run_cfg: DictConfig, cfg_dir: Path, run_id: str) -> Path:
     cfg_path = cfg_dir / f"{run_id}.yaml"
     OmegaConf.save(run_cfg, cfg_path)
     return cfg_path
-
-
-def run_id_material(run_cfg: DictConfig) -> dict:
-    """Plain-dict view of the run config for hashing into run_id.
-
-    Strips fields that are observability/wiring rather than part of the run's
-    training identity. Equivalent CLI invocations that resolve to the same
-    config collapse to the same run_id; YAML edits that genuinely change the
-    config produce a new run_id.
-    """
-    cfg = OmegaConf.to_container(run_cfg, resolve=True)
-    training = cfg.get("training") if isinstance(cfg, dict) else None
-    if isinstance(training, dict):
-        training.pop("project", None)
-    return cfg
 
 
 # ---------- launch log ----------
@@ -365,22 +341,6 @@ def tag_is_ancestor_of_head(workdir: Path, tag: str) -> bool:
 def force_update_tag(workdir: Path, tag: str, message: str) -> None:
     """Move an annotated tag to the current HEAD."""
     _git(workdir, ["tag", "-f", "-a", tag, "-m", message])
-
-
-def existing_run_ids(experiment_dir: Path) -> set[str]:
-    """Collect all run_ids from prior launches in this experiment."""
-    launches = experiment_dir / "launches.jsonl"
-    if not launches.exists():
-        return set()
-    out: set[str] = set()
-    with open(launches) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            out.update(rec.get("run_ids", []))
-    return out
 
 
 def create_tag(workdir: Path, tag: str, message: str) -> None:
@@ -680,7 +640,7 @@ def resolve_snapshot_mode(
     experiment_dir: Path,
 ) -> SnapshotMode:
     # Pre-flight for non-smoke: study must already exist (framed via /study),
-    # working tree clean, no run_id collisions with prior launches.
+    # working tree clean, and snapshot/tag state consistent.
     #
     # Re-launching into an existing experiment is supported as an *extension*:
     # additional runs (e.g. a wider sweep grid) are submitted into the same
@@ -752,29 +712,10 @@ def build_run_plan(args: argparse.Namespace, cfg: DictConfig, experiment_dir: Pa
     jobs_info = []
     for overrides, seed in run_specs:
         run_cfg = build_run_config(cfg, overrides, seed)
-        run_id = short_hash(run_id_material(run_cfg))
+        run_id = secrets.token_hex(4)
         cfg_path = save_run_config(run_cfg, cfg_dir, run_id)
         jobs_info.append((run_id, cfg_path))
     return RunPlan(combos=combos, seeds=seeds, jobs_info=jobs_info)
-
-
-def require_new_run_ids(
-    args: argparse.Namespace, experiment_dir: Path, jobs_info: list[tuple[str, Path]]
-) -> None:
-    # When extending an existing experiment, refuse if any new run_id collides
-    # with a prior one (deterministic hash → same config; we'd silently
-    # overwrite status / metrics / results).
-    if args.smoke:
-        return
-    prior_run_ids = existing_run_ids(experiment_dir)
-    new_run_ids = [rid for rid, _ in jobs_info]
-    collisions = sorted(set(new_run_ids) & prior_run_ids)
-    if collisions:
-        sys.exit(
-            f"Refusing to launch: run_id collision with prior launches in "
-            f"this experiment: {collisions}. Same (config, seed) → same hash. "
-            f"Change the sweep grid (or the seed offset) so the new runs differ."
-        )
 
 
 def build_launch_record(
@@ -885,7 +826,6 @@ def main(argv=None):
         args, paths.cwd, paths.workdir, study, experiment_dir
     )
     run_plan = build_run_plan(args, cfg, experiment_dir)
-    require_new_run_ids(args, experiment_dir, run_plan.jobs_info)
 
     launch_record = build_launch_record(
         args, paths, cluster, use_slurm, study, snapshot, run_plan
@@ -966,7 +906,6 @@ def _submit_slurm(
                 workdir=workdir,
                 cfg_path=cfg_path,
                 experiment=args.experiment,
-                run_id=run_id,
                 gpus_per_node=int(cluster.gpus_per_node),
                 nodes=int(cluster.nodes),
                 setup_commands=setup_commands,
