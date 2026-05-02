@@ -151,8 +151,10 @@ class JEPA(nn.Module):
             "pred": pred,
             "action_pred": None,
             "action_log_prob": None,
+            "action_mse": None,
             "rollout_action_pred": None,
             "rollout_action_log_prob": None,
+            "rollout_action_mse": None,
         }
         for k in ("kl", "mu", "logvar"):
             if k in pred_out:
@@ -164,13 +166,16 @@ class JEPA(nn.Module):
             out = self.action_decoder(state.detach(), actions)
             result["action_pred"] = out.get("pred")
             result["action_log_prob"] = out.get("log_prob")
+            result["action_mse"] = out.get("mse")
 
             if self.has_bottleneck:
                 imagined = torch.cat([state[:, :1], pred], dim=1).detach()
                 rollout_out = self.action_decoder(imagined, actions)
                 rout_pred = rollout_out.get("pred")
                 rout_lp = rollout_out.get("log_prob")
+                rout_mse = rollout_out.get("mse")
                 result["rollout_action_pred"] = rout_pred.detach() if rout_pred is not None else None
                 result["rollout_action_log_prob"] = rout_lp.detach() if rout_lp is not None else None
+                result["rollout_action_mse"] = rout_mse.detach() if rout_mse is not None else None
 
         return result

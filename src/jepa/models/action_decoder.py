@@ -37,13 +37,44 @@ class FlowHead(nn.Module):
         return self.flow(context).rsample()
 
 
+class MeanHead(nn.Module):
+    """Deterministic μ head for continuous actions, trained with MSE.
+
+    Counterpart to `FlowHead` for the mean-vs-flow ablation.
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        context_dim: int,
+        hidden: tuple[int, ...] = (128, 128),
+    ) -> None:
+        super().__init__()
+        layers: list[nn.Module] = []
+        prev = context_dim
+        for h in hidden:
+            layers += [nn.Linear(prev, h), nn.SiLU()]
+            prev = h
+        layers.append(nn.Linear(prev, action_dim))
+        self.mlp = nn.Sequential(*layers)
+
+    def sample(self, context):
+        return self.mlp(context)
+
+    def squared_error(self, actions, context):
+        pred = self.mlp(context)
+        return ((pred - actions) ** 2).mean(dim=-1)
+
+
 class ActionDecoder(nn.Module):
     """Causal transformer mapping tokenized states (B, T, N, D) to per-step actions.
 
-    Output depends on `action_type`:
+    Output depends on `action_type` and (for continuous) `head_type`:
       - "discrete": forward returns {"pred": (B, T-1, num_classes)} logits.
-      - "continuous": flow head. forward(x, actions) returns {"log_prob": (B, T-1)};
-        forward(x) returns {"pred": (B, T-1, action_dim)} via a sample.
+      - "continuous" + "flow": forward(x, actions) → {"log_prob": (B, T-1)};
+        forward(x) → {"pred": (B, T-1, action_dim)} via a sample.
+      - "continuous" + "mean": forward(x, actions) → {"mse": (B, T-1)};
+        forward(x) → {"pred": (B, T-1, action_dim)} (deterministic μ).
     """
 
     def __init__(self, config) -> None:
@@ -54,6 +85,7 @@ class ActionDecoder(nn.Module):
         self.depth = int(config.get("depth", 2))
         self.action_dim = int(config["action_dim"])
         self.action_type = str(config.get("action_type", "continuous"))
+        self.head_type = str(config.get("head_type", "flow"))
         self.dropout = float(config.get("dropout", 0.0))
 
         self.rope = RotaryEmbedding(PredictorBlock.HEAD_DIM, theta=100.0)
@@ -67,13 +99,22 @@ class ActionDecoder(nn.Module):
         if self.action_type == "discrete":
             self.head = nn.Linear(self.dim, self.action_dim)
         elif self.action_type == "continuous":
-            self.head = FlowHead(
-                action_dim=self.action_dim,
-                context_dim=self.dim,
-                transforms=int(config.get("flow_transforms", 4)),
-                bins=int(config.get("flow_bins", 8)),
-                hidden=tuple(config.get("flow_hidden", (128, 128))),
-            )
+            if self.head_type == "flow":
+                self.head = FlowHead(
+                    action_dim=self.action_dim,
+                    context_dim=self.dim,
+                    transforms=int(config.get("flow_transforms", 4)),
+                    bins=int(config.get("flow_bins", 8)),
+                    hidden=tuple(config.get("flow_hidden", (128, 128))),
+                )
+            elif self.head_type == "mean":
+                self.head = MeanHead(
+                    action_dim=self.action_dim,
+                    context_dim=self.dim,
+                    hidden=tuple(config.get("mean_hidden", (128, 128))),
+                )
+            else:
+                raise ValueError(f"Unknown head_type: {self.head_type!r}")
         else:
             raise ValueError(f"Unknown action_type: {self.action_type!r}")
 
@@ -92,5 +133,8 @@ class ActionDecoder(nn.Module):
 
         if actions is None:
             return {"pred": self.head.sample(ctx)}
+
+        if self.head_type == "mean":
+            return {"mse": self.head.squared_error(actions, ctx)}
 
         return {"log_prob": self.head.log_prob(actions, ctx)}

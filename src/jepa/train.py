@@ -210,6 +210,7 @@ def get_loss_fn(config):
     action_config = config.get("action_decoder", {})
     action_enabled = bool(action_config.get("enabled", False))
     action_type = action_config.get("action_type", "continuous")
+    head_type = action_config.get("head_type", "flow")
     sigreg_marginal = config.get("training", {}).get("sigreg_marginal", "full")
     kl_beta = float(config.get("predictor", {}).get("kl_beta", 1.0))
     detach_cond_target = config.get("training", {}).get("detach_cond_target", False)
@@ -223,14 +224,25 @@ def get_loss_fn(config):
             )
 
         if action_type == "continuous":
-            log_prob = result.get("action_log_prob")
-            if log_prob is None:
-                raise ValueError(
-                    "Continuous action decoder did not return a log-probability. "
-                    "Ensure actions are passed into the forward pass."
-                )
-            nll = -log_prob.mean()
-            return {"action": nll, "action_nll": nll}
+            if head_type == "flow":
+                log_prob = result.get("action_log_prob")
+                if log_prob is None:
+                    raise ValueError(
+                        "Flow action decoder did not return a log-probability. "
+                        "Ensure actions are passed into the forward pass."
+                    )
+                nll = -log_prob.mean()
+                return {"action": nll, "action_nll": nll}
+            if head_type == "mean":
+                mse = result.get("action_mse")
+                if mse is None:
+                    raise ValueError(
+                        "Mean action decoder did not return MSE. "
+                        "Ensure actions are passed into the forward pass."
+                    )
+                loss = mse.mean()
+                return {"action": loss, "action_mse": loss}
+            raise ValueError(f"Unknown action decoder head_type: {head_type}")
 
         if action_type == "discrete":
             pred = result.get("action_pred")
@@ -267,10 +279,17 @@ def get_loss_fn(config):
             acc = (logits.argmax(dim=-1) == target).float().mean()
             return {"rollout_action_acc": acc}
         if action_type == "continuous":
-            log_prob = result.get("rollout_action_log_prob")
-            if log_prob is None:
-                return {}
-            return {"rollout_action_nll": -log_prob.mean()}
+            if head_type == "flow":
+                log_prob = result.get("rollout_action_log_prob")
+                if log_prob is None:
+                    return {}
+                return {"rollout_action_nll": -log_prob.mean()}
+            if head_type == "mean":
+                mse = result.get("rollout_action_mse")
+                if mse is None:
+                    return {}
+                return {"rollout_action_mse": mse.mean()}
+            return {}
         return {}
 
     def compute_loss(result, actions, step):
