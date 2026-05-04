@@ -85,7 +85,7 @@ class ActionDecoder(nn.Module):
         self.depth = int(config.get("depth", 2))
         self.action_dim = int(config["action_dim"])
         self.action_type = str(config.get("action_type", "continuous"))
-        self.head_type = str(config.get("head_type", "flow"))
+        self.head_type = str(config.get("head_type", "mean"))
         self.dropout = float(config.get("dropout", 0.0))
 
         self.rope = RotaryEmbedding(PredictorBlock.HEAD_DIM, theta=100.0)

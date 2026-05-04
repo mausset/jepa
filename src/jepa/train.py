@@ -210,7 +210,7 @@ def get_loss_fn(config):
     action_config = config.get("action_decoder", {})
     action_enabled = bool(action_config.get("enabled", False))
     action_type = action_config.get("action_type", "continuous")
-    head_type = action_config.get("head_type", "flow")
+    head_type = action_config.get("head_type", "mean")
     sigreg_marginal = config.get("training", {}).get("sigreg_marginal", "full")
     kl_beta = float(config.get("predictor", {}).get("kl_beta", 1.0))
     detach_cond_target = config.get("training", {}).get("detach_cond_target", False)
