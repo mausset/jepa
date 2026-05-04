@@ -66,9 +66,9 @@ def plot_execution_trajectories(traj_frames, horizon, env_name, step_num, output
 
 
 def plot_execution_endpoints(traj_frames, env_name, step_num, output_path):
-    """Companion to `plot_execution_trajectories`: large first/last frames per
-    episode. Layout — n_episodes rows × 4 columns:
-        real_first | real_last | exec_first | exec_last
+    """Companion to `plot_execution_trajectories`: large final-state frames per
+    episode. Layout — n_episodes rows × 2 columns:
+        real_final | exec_final
     """
     n_episodes = len(traj_frames)
     cell = 3.0  # bigger than the time-grid cells
@@ -76,16 +76,14 @@ def plot_execution_endpoints(traj_frames, env_name, step_num, output_path):
     exec_color = "#ee854a"
 
     fig = plt.figure(
-        figsize=(4 * cell + 0.6, n_episodes * cell + 0.8),
+        figsize=(2 * cell + 0.6, n_episodes * cell + 0.8),
         facecolor="white",
     )
-    gs = fig.add_gridspec(n_episodes, 4, wspace=0.04, hspace=0.10,
+    gs = fig.add_gridspec(n_episodes, 2, wspace=0.04, hspace=0.10,
                           left=0.04, right=0.99, top=0.90, bottom=0.02)
 
     col_specs = (
-        ("real", 0, "real $t=0$", real_color),
         ("real", -1, "real $t=H$", real_color),
-        ("exec", 0, "exec $t=0$", exec_color),
         ("exec", -1, "exec $t=H$", exec_color),
     )
     for ep_i, pair in enumerate(traj_frames):
