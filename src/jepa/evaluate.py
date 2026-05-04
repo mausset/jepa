@@ -64,6 +64,22 @@ EVALS: dict[str, dict] = {
         "runner": _planning_runner_factory("mppi"),
         "output_basename": _planning_basename("mppi"),
     },
+    "planning_smc": {
+        "runner": _planning_runner_factory("smc"),
+        "output_basename": _planning_basename("smc"),
+    },
+    "planning_cem": {
+        "runner": _planning_runner_factory("cem"),
+        "output_basename": _planning_basename("cem"),
+    },
+    "planning_beam": {
+        "runner": _planning_runner_factory("beam"),
+        "output_basename": _planning_basename("beam"),
+    },
+    "planning_collocation": {
+        "runner": _planning_runner_factory("collocation"),
+        "output_basename": _planning_basename("collocation"),
+    },
 }
 
 
