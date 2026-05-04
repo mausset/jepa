@@ -315,18 +315,22 @@ def evaluate_episode(
     traj_pair = None
 
     if model.action_decoder is not None:
-        opt_exec = execute_plan_in_env(
-            model, env, ep_data, traj_opt, rng, frame_size, device
-        )
         real_exec = execute_plan_in_env(
             model, env, ep_data, ep_data.traj_real, rng, frame_size, device
         )
-        ep.exec_dist = opt_exec.latent_dist
         ep.exec_dist_real = real_exec.latent_dist
-        ep.state_dist = opt_exec.state_dist
         ep.state_dist_real = real_exec.state_dist
-        if capture_frames:
-            traj_pair = {"real": ep_data.frames, "exec": opt_exec.frames}
+
+        if traj_opt is not None:
+            opt_exec = execute_plan_in_env(
+                model, env, ep_data, traj_opt, rng, frame_size, device
+            )
+            ep.exec_dist = opt_exec.latent_dist
+            ep.state_dist = opt_exec.state_dist
+            if capture_frames:
+                traj_pair = {"real": ep_data.frames, "exec": opt_exec.frames}
+        elif capture_frames:
+            traj_pair = {"real": ep_data.frames, "exec": real_exec.frames}
 
     return ep.to_json(), traj_pair
 
@@ -363,13 +367,13 @@ def collect_episodes(
             if not pending:
                 break
 
-            traj_opt_batch = plan_batch(planner, pending)
+            traj_opt_batch = plan_batch(planner, pending) if planner is not None else None
             for i, ep_data in enumerate(pending):
                 ep, frames = evaluate_episode(
                     model=model,
                     env=env,
                     ep_data=ep_data,
-                    traj_opt=traj_opt_batch[i : i + 1],
+                    traj_opt=traj_opt_batch[i : i + 1] if traj_opt_batch is not None else None,
                     rng=rng,
                     frame_size=frame_size,
                     device=device,
@@ -405,16 +409,18 @@ def aggregate(episodes):
         ("success_rate_latent", "exec_dist", "exec_dist_real"),
         ("success_rate_state",  "state_dist", "state_dist_real"),
     ):
-        if opt_key not in episodes[0]:
+        if real_key not in episodes[0]:
             continue
-        opt_dists = [ep[opt_key] for ep in episodes]
         real_dists = [ep[real_key] for ep in episodes]
-        n = len(opt_dists)
-        out[label] = {
+        n = len(real_dists)
+        block = {
             "thresholds": list(EPS_THRESHOLDS),
-            "opt": success_curve(opt_dists, EPS_THRESHOLDS, n),
             "real": success_curve(real_dists, EPS_THRESHOLDS, n),
         }
+        if opt_key in episodes[0]:
+            opt_dists = [ep[opt_key] for ep in episodes]
+            block["opt"] = success_curve(opt_dists, EPS_THRESHOLDS, n)
+        out[label] = block
 
     return out
 
@@ -445,11 +451,13 @@ def resolve_output_path(args):
 
 
 def require_latent_model(model) -> None:
-    if not model.has_bottleneck:
-        raise ValueError(
-            "planning eval requires a latent bottleneck predictor "
-            f"(fsq or vae), got {model.bottleneck_type!r}"
-        )
+    """No-op kept for callers that want to enforce a bottleneck. The default
+    eval flow now degrades gracefully for bottleneck=none: it skips planning
+    and emits only `*_real` metrics (decoder applied to encoded random
+    rollout), since planning requires a per-step latent prior the deterministic
+    predictor doesn't have.
+    """
+    return
 
 
 def build_eval_result(
@@ -515,10 +523,12 @@ def print_summary(result: dict[str, Any]) -> None:
     lat = metrics.get("success_rate_latent")
     sta = metrics.get("success_rate_state")
     for i, eps in enumerate(EPS_THRESHOLDS):
-        lat_opt  = f"{lat['opt']['rates'][i] * 100:6.1f}%" if lat else "    -- "
-        lat_real = f"{lat['real']['rates'][i] * 100:6.1f}%" if lat else "    -- "
-        sta_opt  = f"{sta['opt']['rates'][i] * 100:6.1f}%" if sta else "    -- "
-        sta_real = f"{sta['real']['rates'][i] * 100:6.1f}%" if sta else "    -- "
+        def _rate(block, key):
+            return f"{block[key]['rates'][i] * 100:6.1f}%" if block and key in block else "    -- "
+        lat_opt  = _rate(lat, "opt")
+        lat_real = _rate(lat, "real")
+        sta_opt  = _rate(sta, "opt")
+        sta_real = _rate(sta, "real")
         print(f"  {eps:9.4f}   {lat_opt:>8} {lat_real:>9}   {sta_opt:>8} {sta_real:>9}")
 
 
@@ -527,10 +537,14 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model, step, _config = load_model(args.checkpoint, device)
-    require_latent_model(model)
 
     env, frame_size = build_env(args.env_config, args.env_name)
-    planner, planner_cfg = build_planner(args, model)
+    if model.has_bottleneck:
+        planner, planner_cfg = build_planner(args, model)
+    else:
+        # bottleneck=none: skip the planner entirely; eval will only produce
+        # *_real metrics (decoder applied to the encoded random rollout).
+        planner, planner_cfg = None, {"name": "none", "reason": "bottleneck=none"}
     rng = np.random.default_rng(args.seed)
 
     try:
