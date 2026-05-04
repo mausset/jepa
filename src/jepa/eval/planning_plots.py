@@ -62,6 +62,60 @@ def plot_execution_trajectories(traj_frames, horizon, env_name, step_num, output
     plt.close(fig)
     print(f"Wrote {plot_path}")
 
+    plot_execution_endpoints(traj_frames, env_name, step_num, output_path)
+
+
+def plot_execution_endpoints(traj_frames, env_name, step_num, output_path):
+    """Companion to `plot_execution_trajectories`: large first/last frames per
+    episode. Layout — n_episodes rows × 4 columns:
+        real_first | real_last | exec_first | exec_last
+    """
+    n_episodes = len(traj_frames)
+    cell = 3.0  # bigger than the time-grid cells
+    real_color = "#4878d0"
+    exec_color = "#ee854a"
+
+    fig = plt.figure(
+        figsize=(4 * cell + 0.6, n_episodes * cell + 0.8),
+        facecolor="white",
+    )
+    gs = fig.add_gridspec(n_episodes, 4, wspace=0.04, hspace=0.10,
+                          left=0.04, right=0.99, top=0.90, bottom=0.02)
+
+    col_specs = (
+        ("real", 0, "real $t=0$", real_color),
+        ("real", -1, "real $t=H$", real_color),
+        ("exec", 0, "exec $t=0$", exec_color),
+        ("exec", -1, "exec $t=H$", exec_color),
+    )
+    for ep_i, pair in enumerate(traj_frames):
+        for col_i, (key, t, title, color) in enumerate(col_specs):
+            ax = fig.add_subplot(gs[ep_i, col_i])
+            frames = pair[key]
+            ax.imshow(frames[t], interpolation="nearest")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            if ep_i == 0:
+                ax.set_title(title, fontsize=11, color=color, pad=6)
+            if col_i == 0:
+                ax.text(
+                    -0.04, 0.5, f"ep {ep_i}",
+                    transform=ax.transAxes,
+                    fontsize=9, color="#555",
+                    ha="right", va="center",
+                )
+
+    fig.suptitle(
+        f"Endpoints — {env_name} @ step {step_num}",
+        fontsize=13, color="#222", y=0.985,
+    )
+    plot_path = output_path.with_name(output_path.stem + "_endpoints.png")
+    fig.savefig(plot_path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
+    print(f"Wrote {plot_path}")
+
 
 def plot_dist_hist(ax, opt, real, mean_opt, mean_real, xlabel, title):
     style_ax(ax)
