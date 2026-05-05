@@ -10,6 +10,11 @@ from jepa.utils.helpers import block_attention_mask
 
 
 VIT_VARIANTS = {
+    "vit-t": {
+        "dim": 192,
+        "depth": 12,
+        "heads": 3,
+    },
     "vit-s": {
         "dim": 384,
         "depth": 12,
