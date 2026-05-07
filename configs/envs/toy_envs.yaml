@@ -35,6 +35,25 @@ envs:
       elevation: -32
       azimuth: 210
 
+  push_v4:
+    kind: push
+    env_id: FetchPush-v4
+    train_episodes: 10000
+    val_episodes: 2000
+    max_steps: 100
+    action_repeat: 5
+    frame_size: [224, 224]
+    camera:
+      lookat: [1.3, 0.75, 0.55]
+      distance: 2.0
+      elevation: -30
+      azimuth: 180
+    camera_random:
+      distance: [1.7, 2.6]
+      elevation: [-60, -15]
+      azimuth: [0, 360]
+      lookat_jitter: [0.0, 0.0, 0.0]
+
   keydoor:
     kind: keydoor
     env_id: MiniGrid-DoorKey-16x16-v0

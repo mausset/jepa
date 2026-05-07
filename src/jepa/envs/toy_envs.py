@@ -211,7 +211,86 @@ class PushEnv(GymToyEnv):
                 "azimuth": 180,
             },
         )
+        self.camera_base = dict(merged["camera"])
+        self.camera_random = merged.get("camera_random")
+        self.min_cube_pixels = int(merged.get("min_cube_pixels", 64))
+        self.visibility_render_size = int(merged.get("visibility_render_size", 224))
+        self.max_camera_retries = int(merged.get("max_camera_retries", 50))
+        self._seg_renderer = None
         super().__init__(merged)
+
+    def sample_camera(self, rng: np.random.Generator):
+        if self.camera_random is None:
+            return None
+        cam = dict(self.camera_base)
+        cr = self.camera_random
+        if "distance" in cr:
+            lo, hi = cr["distance"]
+            cam["distance"] = float(rng.uniform(lo, hi))
+        if "elevation" in cr:
+            lo, hi = cr["elevation"]
+            cam["elevation"] = float(rng.uniform(lo, hi))
+        if "azimuth" in cr:
+            lo, hi = cr["azimuth"]
+            cam["azimuth"] = float(rng.uniform(lo, hi))
+        if "lookat_jitter" in cr:
+            dx, dy, dz = cr["lookat_jitter"]
+            base = np.asarray(cam["lookat"], dtype=float)
+            cam["lookat"] = (
+                base + rng.uniform([-dx, -dy, -dz], [dx, dy, dz])
+            ).tolist()
+        return cam
+
+    def cube_visible_pixels(self, cam_cfg) -> int:
+        """Render a segmentation pass and count pixels covered by the cube
+        geom. Used to reject occluded/uninformative POVs."""
+        import mujoco
+
+        u = self.env.unwrapped
+        model, data = u.model, u.data
+        cube_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "object0")
+        if cube_geom < 0:
+            return -1
+        if self._seg_renderer is None:
+            self._seg_renderer = mujoco.Renderer(
+                model, height=self.visibility_render_size,
+                width=self.visibility_render_size,
+            )
+            self._seg_renderer.enable_segmentation_rendering()
+        cam = mujoco.MjvCamera()
+        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+        cam.lookat[:] = np.asarray(cam_cfg["lookat"], dtype=float)
+        cam.distance = float(cam_cfg["distance"])
+        cam.azimuth = float(cam_cfg["azimuth"])
+        cam.elevation = float(cam_cfg["elevation"])
+        self._seg_renderer.update_scene(data, camera=cam)
+        seg = self._seg_renderer.render()
+        return int((seg[..., 0] == cube_geom).sum())
+
+    def reset(self, rng: np.random.Generator):
+        if self.camera_random is None:
+            super().reset(rng)
+            return
+        self.last_camera_attempts = 0
+        for attempt in range(self.max_camera_retries):
+            self.last_camera_attempts += 1
+            cam = self.sample_camera(rng)
+            self.configure_camera({"camera": cam})
+            super().reset(rng)
+            n_pix = self.cube_visible_pixels(cam)
+            if n_pix < 0 or n_pix >= self.min_cube_pixels:
+                return
+        raise RuntimeError(
+            f"PushEnv: failed to find a POV with cube_pixels >= "
+            f"{self.min_cube_pixels} after {self.max_camera_retries} retries; "
+            "tighten camera_random ranges."
+        )
+
+    def close(self):
+        if self._seg_renderer is not None:
+            self._seg_renderer.close()
+            self._seg_renderer = None
+        super().close()
 
 
 class PushTEnv(ToyEnv):
