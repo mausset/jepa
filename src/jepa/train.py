@@ -120,8 +120,9 @@ def plot_error_spectrum(result):
     return img
 
 
-def compute_training_metrics(result):
-    """Compute all training metrics."""
+def compute_training_metrics(result, *, with_spectrum=False):
+    """Compute all training metrics. With `with_spectrum`, also includes a
+    `wandb.Image` of the eigenvalue spectra under key `error_spectrum`."""
 
     metrics = {}
 
@@ -144,6 +145,11 @@ def compute_training_metrics(result):
     if v.shape[1] >= 2:
         cos = F.cosine_similarity(v[:, :-1], v[:, 1:], dim=-1)  # (B, T-2, N)
         metrics["path_straightness"] = cos.mean()
+
+    if with_spectrum:
+        img = plot_error_spectrum(result)
+        if img is not None:
+            metrics["error_spectrum"] = img
 
     return metrics
 
@@ -557,22 +563,22 @@ def train(
             result = model(x, actions)
         loss = loss_fn(result, actions, step)
 
+        # Read `result` BEFORE opt_step: torch.compile may reuse forward-activation
+        # storage during backward, clobbering values read afterward.
+        metrics = compute_training_metrics(
+            result, with_spectrum=step % 100 == 0 and bool(wandb.run)
+        )
+
         opt_step(loss["total"], model, optimizer)
 
-        metrics = compute_training_metrics(result)
         log_progress(pbar, step, loss, metrics)
 
-        if step % 100 == 0:
-            if wandb.run:
-                img = plot_error_spectrum(result)
-                if img is not None:
-                    wandb.log({"train/error_spectrum": img}, step=step)
-            if metrics_logger is not None:
-                scalar = to_scalar_dict(loss, prefix="loss/")
-                scalar.update(to_scalar_dict(metrics, prefix="metric/"))
-                metrics_logger.log(step=step, stage="train", metrics=scalar)
-                if status is not None:
-                    status.heartbeat(step, scalar)
+        if step % 100 == 0 and metrics_logger is not None:
+            scalar = to_scalar_dict(loss, prefix="loss/")
+            scalar.update(to_scalar_dict(metrics, prefix="metric/"))
+            metrics_logger.log(step=step, stage="train", metrics=scalar)
+            if status is not None:
+                status.heartbeat(step, scalar)
 
         if val_interval > 0 and step % val_interval == 0 and step < total_steps:
             val_metrics = val_epoch(model, val_loader, loss_fn, step, max_steps=val_max_steps)
