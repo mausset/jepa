@@ -5,6 +5,7 @@ checkpoints/
 plots/
 slurm_out/
 temp_configs/
+explore/
 CLAUDE.md
 AGENTS.md
 figures/
