@@ -41,7 +41,6 @@ def video_pipe(
         random_shuffle=True,  # Always shuffle, otherwise val perf is not indicative
         initial_fill=16,
         prefetch_queue_depth=1,
-        pad_sequences=True,
         name="Reader",
     )
 
