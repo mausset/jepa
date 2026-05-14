@@ -235,7 +235,6 @@ class ViT(nn.Module):
 
         r, x = unpack(x, ps, "b * d")
         r = self.projector(r)
-        x = self.projector(x)
 
         return {"register": r, "feature_map": x}
 
@@ -276,7 +275,7 @@ class ConvNeXtEncoder(nn.Module):
         pooled = self.proj(pooled)
         token = self.projector(pooled).unsqueeze(1)
         feature_map = rearrange(feature_grid, "b c h w -> b (h w) c")
-        feature_map = self.projector(self.proj(feature_map))
+        feature_map = self.proj(feature_map)
 
         return {"register": token, "feature_map": feature_map}
 
