@@ -274,10 +274,8 @@ class ConvNeXtEncoder(nn.Module):
         pooled = self.pool(feature_grid).flatten(1)
         pooled = self.proj(pooled)
         token = self.projector(pooled).unsqueeze(1)
-        feature_map = rearrange(feature_grid, "b c h w -> b (h w) c")
-        feature_map = self.proj(feature_map)
 
-        return {"register": token, "feature_map": feature_map}
+        return {"register": token}
 
 
 def build_encoder(encoder_args):
