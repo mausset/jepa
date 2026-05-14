@@ -630,6 +630,8 @@ def main():
 
     local_rank, global_rank, world_size = setup_distributed()
     model = model.to(local_rank)
+    if world_size > 1:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = DDP(model, device_ids=[local_rank])
     model = torch.compile(model)
 
