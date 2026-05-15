@@ -148,7 +148,7 @@ class PredictorBlock(nn.Module):
 
 
 class Predictor(nn.Module):
-    LOGVAR_CLAMP = (-10.0, 5.0)
+    LOGVAR_CLAMP = (-30.0, 20.0)
 
     def __init__(self, predictor_args) -> None:
         super().__init__()
